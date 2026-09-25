@@ -84,265 +84,484 @@ Se tudo estiver certo, em alguns segundos as 3 linhas do arquivo devem aparecer 
 terraform destroy
 ```
 
+
 # Título
 
-Processar arquivo de operações do S3 e persistir no DynamoDB utilizando AWS Batch
+Criar estrutura de persistência DynamoDB para operações e registros em clearing via Terraform
 
 # Objetivo
 
-Implementar o processamento de arquivos CSV contendo operações de aplicações e resgates disponibilizados em um bucket S3.
+Provisionar, através de Terraform, as tabelas Amazon DynamoDB necessárias para persistir as operações recebidas pelo sistema, as informações de registro nas diferentes clearings e o histórico de alterações de status.
 
-O processamento deverá ser executado utilizando AWS Batch, permitindo o tratamento de arquivos de grande volume, atualmente estimados entre **20 e 30 milhões de registros por arquivo**.
+A infraestrutura deverá suportar o cenário de **multi-clearing**, permitindo que uma operação seja associada à clearing responsável pelo registro e que seu ciclo de vida possa ser rastreado.
 
-Cada registro válido deverá ser transformado em uma operação e persistido na tabela de operações do DynamoDB.
+Esta história contempla exclusivamente a criação e configuração das estruturas DynamoDB e seus recursos de infraestrutura.
 
-O escopo desta história termina após a persistência da operação no DynamoDB. O processamento de eventos do DynamoDB Streams e o posterior envio das operações para as clearings não fazem parte desta história.
+DynamoDB Streams, processamento de eventos, Lambdas, SQS e integrações com clearings não fazem parte desta história.
 
 # Descrição detalhada
 
-Um arquivo CSV contendo operações financeiras será disponibilizado em um bucket Amazon S3.
+O sistema de registro em clearing necessita de uma estrutura de persistência capaz de armazenar as operações recebidas através das diferentes fontes de entrada e acompanhar posteriormente o processo de registro dessas operações nas clearings.
 
-A criação do arquivo deverá gerar um evento que iniciará o processamento através do AWS Batch.
+A infraestrutura deverá ser criada utilizando **Terraform**, seguindo os padrões de infraestrutura como código adotados pelo projeto.
 
-O arquivo poderá conter aproximadamente **20 milhões de registros, podendo atingir cerca de 30 milhões de registros**, sendo normalmente disponibilizado uma vez ao dia, eventualmente duas vezes no mesmo dia.
+Inicialmente deverão ser contempladas três estruturas lógicas:
 
-O processamento deverá ser realizado sem a necessidade de carregar o arquivo completo em memória.
+```text id="9dkt97"
+Operations
 
-O AWS Batch deverá ler o arquivo de maneira incremental/streaming e transformar cada linha válida em uma operação do domínio.
+Registration
 
-Cada operação deverá conter as informações existentes no arquivo necessárias para identificação e processamento posterior, incluindo a identificação da clearing de destino quando essa informação estiver disponível no arquivo.
-
-Exemplo conceitual:
-
-```text
-S3
- │
- │ CSV
- │ 20–30 milhões de registros
- ▼
-EventBridge
- │
- ▼
-AWS Batch
- │
- ├── leitura streaming
- ├── parsing CSV
- ├── validação estrutural
- ├── transformação
- ├── identificação da operação
- └── persistência em lote
-          │
-          ▼
-      DynamoDB
-      Operations
+Status History
 ```
 
-O processamento deverá suportar paralelização do arquivo quando necessário para atingir o throughput esperado. A estratégia de particionamento deverá garantir que um registro CSV não seja dividido incorretamente entre dois workers.
+A estrutura deverá ser preparada para suportar múltiplas clearings, não existindo dependência fixa da B3 no modelo de dados.
 
-A implementação deverá considerar que um Batch Job pode ser interrompido ou executado novamente. Portanto, o processamento deverá ser **idempotente**, evitando a criação de operações duplicadas em caso de retry.
+## Operations
 
-A identificação da operação deverá utilizar preferencialmente uma chave única proveniente do negócio. Caso o arquivo não forneça um identificador único, deverá ser definida uma estratégia determinística para geração da chave de idempotência.
+Responsável por armazenar os dados da operação recebida pelo sistema.
 
-A persistência no DynamoDB deverá utilizar operações em lote sempre que aplicável, respeitando os limites da API e realizando retry dos itens eventualmente não processados.
+Modelo lógico inicial:
 
-Uma falha de validação em uma linha individual não deverá interromper o processamento de todo o arquivo.
+```text id="fjwrr4"
+PK = OPERATION#<OperationId>
+SK = METADATA
+```
 
-Falhas técnicas que impossibilitem a continuidade do processamento deverão resultar em falha do job ou da respectiva partição, permitindo posterior retry.
+Exemplo:
 
-# Requisitos
+```text id="ntq5t2"
+PK = OPERATION#123456
+SK = METADATA
 
-**RF01 — Detecção do arquivo**
-
-A criação de um arquivo elegível no bucket S3 deverá iniciar o fluxo responsável pela execução do AWS Batch.
-
-**RF02 — Processamento de grandes volumes**
-
-A solução deverá suportar arquivos contendo pelo menos **30 milhões de registros**.
-
-**RF03 — Leitura incremental**
-
-O arquivo deverá ser processado através de streaming ou mecanismo equivalente, não sendo permitido carregar o conteúdo completo do arquivo em memória.
-
-**RF04 — Parsing**
-
-Cada registro deverá ser interpretado conforme o layout oficial do CSV.
-
-O parser deverá respeitar corretamente delimitadores, encoding, cabeçalho, campos obrigatórios e regras de escape definidas no contrato do arquivo.
-
-**RF05 — Validação**
-
-Cada registro deverá passar pelas validações estruturais necessárias antes da persistência.
-
-Um registro inválido não deverá interromper o processamento dos demais registros.
-
-**RF06 — Persistência**
-
-Cada registro válido deverá gerar uma operação na tabela `Operations` do DynamoDB.
-
-A operação deverá possuir, no mínimo, informações equivalentes a:
-
-```text
 OperationId
 OperationType
 Clearing
-SourceType = FILE
-SourceEventId / IdempotencyKey
-FileName
+Amount
+OperationDate
+
+SourceType
+SourceEventId
 ImportId
+FileName
+
 Status
+
 CreatedAt
 UpdatedAt
 ```
 
-Os nomes definitivos dos atributos deverão seguir o modelo de domínio aprovado para a tabela.
+O atributo `Clearing` deverá identificar a clearing de destino da operação.
 
-**RF07 — Clearing**
+Exemplos:
 
-Quando a clearing de destino estiver presente no arquivo, essa informação deverá ser persistida juntamente com a operação.
+```text id="jy78i5"
+B3
+CLEARING_X
+CLEARING_Y
+```
+
+Nenhuma regra da estrutura deverá assumir B3 como única clearing possível.
+
+`SourceType` deverá permitir identificar a origem da operação, inicialmente:
+
+```text id="lmt9xr"
+FILE
+```
+
+e futuramente:
+
+```text id="w8okg0"
+KAFKA
+```
+
+A estrutura deverá permitir que novas origens sejam adicionadas sem alteração da chave primária.
+
+---
+
+## Registration
+
+Responsável por representar o **estado atual do registro de uma operação em determinada clearing**.
+
+Modelo lógico inicial:
+
+```text id="9yq67h"
+PK = OPERATION#<OperationId>
+
+SK = REGISTRATION#<Clearing>
+```
 
 Exemplo:
 
-```text
-clearing = B3
+```text id="4csn9q"
+PK = OPERATION#123456
+SK = REGISTRATION#B3
+
+OperationId
+Clearing
+
+Status
+Attempt
+
+ExternalProtocol
+RequestHash
+
+LastError
+
+SentAt
+ResponseAt
+CreatedAt
+UpdatedAt
 ```
 
-A implementação não deverá possuir regra fixa assumindo que todas as operações pertencem à B3, pois a solução deverá suportar múltiplas clearings.
+O modelo deverá permitir que uma mesma operação possua registros associados a diferentes clearings caso essa necessidade exista futuramente.
 
-**RF08 — Idempotência**
+Exemplo:
 
-O reprocessamento de uma linha já persistida não deverá resultar na criação de uma nova operação equivalente.
-
-A identificação utilizada para idempotência deverá ser determinística.
-
-**RF09 — Escrita em lote**
-
-A aplicação deverá utilizar escrita em lote no DynamoDB sempre que aplicável.
-
-Itens retornados como não processados pelo DynamoDB deverão possuir estratégia de retry com backoff.
-
-**RF10 — Paralelização**
-
-A solução deverá permitir que o processamento do arquivo seja dividido entre múltiplos workers/jobs quando necessário.
-
-A estratégia utilizada não poderá provocar perda, duplicação ou quebra de registros devido à divisão do arquivo.
-
-**RF11 — Tratamento de erro**
-
-Erros referentes a registros individuais deverão ser tratados sem interromper todo o processamento.
-
-Falhas técnicas que impeçam a continuidade do processamento deverão ser registradas e provocar falha da unidade de processamento correspondente.
-
-**RF12 — Rastreabilidade**
-
-Os logs deverão permitir identificar, no mínimo:
-
-```text
-ImportId
-FileName
-Chunk/Worker, quando aplicável
-Quantidade processada
-Quantidade persistida
-Quantidade rejeitada
-Quantidade de erros
-Tempo de processamento
+```text id="5x1vd5"
+OPERATION#123456
+    │
+    ├── METADATA
+    │
+    ├── REGISTRATION#B3
+    │
+    └── REGISTRATION#CLEARING_X
 ```
 
-Não deverão ser registrados em log dados financeiros ou informações sensíveis desnecessárias para diagnóstico.
+---
 
-**RF13 — Escopo**
+## Status History
 
-O processamento será considerado concluído, para esta história, após a persistência das operações no DynamoDB.
+Responsável por manter o histórico das mudanças de status do registro.
 
-Estão explicitamente fora do escopo:
+Os registros de histórico deverão ser tratados como **append-only**, evitando sobrescrever o histórico anterior.
 
-```text
-DynamoDB Streams
-EventBridge Pipes
-SQS das clearings
-Registration Worker
-Envio para B3
-Retorno da Pismo
-Atualização do Registration/Status History
+Modelo lógico inicial:
+
+```text id="2tdrjj"
+PK = OPERATION#<OperationId>
+
+SK =
+REGISTRATION#<Clearing>
+#STATUS#<Timestamp>
+#<EventId>
 ```
 
-Esses componentes pertencem às etapas posteriores do fluxo de registro.
+Exemplo:
+
+```text id="v6rg9c"
+PK = OPERATION#123456
+
+SK =
+REGISTRATION#B3
+#STATUS#2026-09-25T15:30:00
+#EVENT#ABC123
+```
+
+A estrutura deverá permitir armazenar:
+
+```text id="wivpm5"
+PreviousStatus
+Status
+
+Clearing
+
+Reason
+Attempt
+
+ExternalProtocol
+EventId
+
+Source
+
+CreatedAt
+```
+
+O objetivo é permitir posteriormente reconstruir o ciclo de vida de uma operação.
+
+Exemplo:
+
+```text id="w1c7ze"
+RECEIVED
+   ↓
+PENDING
+   ↓
+SENT
+   ↓
+REJECTED
+   ↓
+RETRYING
+   ↓
+SENT
+   ↓
+ACCEPTED
+```
+
+A implementação desta história não deverá implementar as regras responsáveis por realizar essas transições.
+
+---
+
+# Requisitos
+
+**RF01 — Infraestrutura como código**
+
+Todos os recursos DynamoDB deverão ser provisionados exclusivamente através de Terraform.
+
+Não deverão ser criados ou configurados recursos manualmente através do AWS Console.
+
+---
+
+**RF02 — Ambientes**
+
+A configuração Terraform deverá permitir o provisionamento das estruturas nos ambientes utilizados pelo projeto, seguindo a estratégia existente de configuração por ambiente.
+
+Os nomes físicos dos recursos deverão seguir o padrão corporativo vigente.
+
+---
+
+**RF03 — Estrutura de Operations**
+
+Deverá existir estrutura DynamoDB capaz de armazenar uma operação utilizando:
+
+```text id="o20lhc"
+PK = OPERATION#<OperationId>
+SK = METADATA
+```
+
+---
+
+**RF04 — Estrutura de Registration**
+
+Deverá existir estrutura capaz de armazenar o estado atual do registro utilizando:
+
+```text id="tyq15v"
+PK = OPERATION#<OperationId>
+SK = REGISTRATION#<Clearing>
+```
+
+---
+
+**RF05 — Estrutura de Status History**
+
+Deverá existir estrutura capaz de armazenar eventos de histórico utilizando:
+
+```text id="dklh8g"
+PK = OPERATION#<OperationId>
+
+SK =
+REGISTRATION#<Clearing>
+#STATUS#<Timestamp>
+#<EventId>
+```
+
+A composição da chave deverá impedir que dois eventos distintos ocorridos no mesmo instante sobrescrevam um ao outro.
+
+---
+
+**RF06 — Multi-clearing**
+
+O modelo não deverá possuir dependência estrutural específica da B3.
+
+A clearing deverá fazer parte dos dados/chaves necessárias para identificar o registro.
+
+---
+
+**RF07 — Capacidade**
+
+O modo de capacidade do DynamoDB deverá ser parametrizável através do Terraform conforme o padrão definido para o projeto.
+
+Caso seja utilizado `PAY_PER_REQUEST`, essa configuração deverá estar explícita no módulo.
+
+Caso seja utilizado provisioned capacity, os valores e eventual autoscaling deverão ser definidos através da infraestrutura como código.
+
+---
+
+**RF08 — Criptografia**
+
+As tabelas deverão possuir criptografia em repouso habilitada conforme o padrão de segurança da organização.
+
+Caso exista uma KMS Key corporativa destinada ao projeto, sua referência deverá ser parametrizada pelo Terraform.
+
+---
+
+**RF09 — Point-in-Time Recovery**
+
+Point-in-Time Recovery deverá ser configurado conforme o padrão de backup e recuperação definido pela organização.
+
+A configuração deverá ser realizada através do Terraform.
+
+---
+
+**RF10 — Tags**
+
+Todos os recursos deverão receber as tags corporativas obrigatórias.
+
+Exemplos, conforme padrão existente:
+
+```text id="m1f4qf"
+Environment
+Application
+Team
+CostCenter
+ManagedBy = Terraform
+```
+
+Os nomes e valores definitivos deverão utilizar o padrão corporativo vigente.
+
+---
+
+**RF11 — Outputs**
+
+O módulo Terraform deverá disponibilizar os outputs necessários para consumo pelos demais componentes da solução.
+
+Exemplos:
+
+```text id="s0rw36"
+TableName
+TableArn
+```
+
+---
+
+**RF12 — Permissões**
+
+A história não contempla a criação de permissões de aplicação além das necessárias ao provisionamento, salvo quando exigido pelo módulo/padrão Terraform existente.
+
+As policies de acesso dos futuros Batch Jobs, Lambdas e demais consumidores deverão ser tratadas nas histórias correspondentes.
+
+---
+
+**RF13 — DynamoDB Streams**
+
+DynamoDB Streams deverá permanecer **desabilitado** nesta entrega.
+
+Não deverão ser criados:
+
+```text id="sp3xk1"
+Stream
+Event Source Mapping
+Lambda de Stream
+EventBridge Pipe
+```
+
+Esses recursos serão tratados posteriormente.
+
+---
 
 # Critérios de aceite
 
 **CA01**
 
-Dado que um arquivo CSV válido seja criado no bucket S3 configurado,
+Dado o código Terraform da solução,
 
-quando o evento de criação do arquivo for identificado,
+quando `terraform plan` for executado,
 
-então o processamento correspondente deverá ser iniciado no AWS Batch.
+então os recursos DynamoDB esperados deverão ser apresentados sem alterações manuais adicionais.
+
+---
 
 **CA02**
 
-Dado um arquivo contendo operações válidas,
+Dado um ambiente sem os recursos,
 
-quando o AWS Batch processar o arquivo,
+quando o Terraform aprovado for aplicado,
 
-então cada operação deverá ser persistida corretamente na tabela `Operations` do DynamoDB.
+então as estruturas DynamoDB deverão ser criadas com sucesso.
+
+---
 
 **CA03**
 
-Dado um arquivo cujo registro informe a clearing de destino,
+Dada uma operação,
 
-quando o registro for persistido,
+deverá ser possível representá-la utilizando:
 
-então a operação deverá manter a clearing informada no arquivo, sem assumir B3 como valor fixo.
+```text id="whl08w"
+PK = OPERATION#<OperationId>
+SK = METADATA
+```
+
+---
 
 **CA04**
 
-Dado um arquivo de grande volume,
+Dada uma operação registrada em determinada clearing,
 
-quando ele for processado,
+deverá ser possível representar seu estado atual utilizando:
 
-então a aplicação não deverá carregar o arquivo completo em memória e deverá realizar sua leitura de forma incremental.
+```text id="uovl19"
+PK = OPERATION#<OperationId>
+SK = REGISTRATION#<Clearing>
+```
+
+---
 
 **CA05**
 
-Dado um arquivo contendo pelo menos um registro inválido,
+Dada uma mudança de status,
 
-quando o registro inválido for encontrado,
+deverá ser possível armazenar múltiplos eventos de histórico para a mesma operação e clearing sem sobrescrever eventos anteriores.
 
-então o erro deverá ser registrado e os demais registros válidos deverão continuar sendo processados.
+---
 
 **CA06**
 
-Dado que uma unidade de processamento seja executada novamente após uma falha,
+Dada uma mesma operação,
 
-quando registros anteriormente persistidos forem encontrados,
+o modelo deverá permitir representar registros de diferentes clearings sem alteração da estrutura da tabela.
 
-então eles não deverão resultar na criação de operações duplicadas.
+---
 
 **CA07**
 
-Dado que uma operação de escrita em lote no DynamoDB retorne itens não processados,
+As configurações de capacidade, criptografia, recuperação e tags deverão estar declaradas no Terraform e seguir os padrões definidos para o projeto.
 
-quando isso ocorrer,
-
-então o sistema deverá realizar novas tentativas conforme a política de retry definida.
+---
 
 **CA08**
 
-Dado que o processamento esteja configurado para execução paralela,
+Os outputs necessários para identificação dos recursos, incluindo nome e ARN, deverão estar disponíveis após a aplicação do Terraform.
 
-quando diferentes workers processarem partes do arquivo,
-
-então nenhum registro poderá ser perdido ou dividido incorretamente em decorrência do particionamento.
+---
 
 **CA09**
 
-Dado um arquivo representativo do volume de produção,
+Após o provisionamento, nenhuma configuração manual no AWS Console deverá ser necessária para completar a criação das estruturas DynamoDB.
 
-quando for executado o teste de carga com **30 milhões de registros**,
-
-então todos os registros válidos deverão ser processados sem perda e o tempo total, throughput, consumo de recursos e quantidade de erros deverão ser registrados para validação da capacidade da solução.
+---
 
 **CA10**
 
-Dado que o AWS Batch tenha persistido uma operação com sucesso no DynamoDB,
+Após a aplicação do Terraform, **DynamoDB Streams deverá permanecer desabilitado**.
 
-então nenhuma chamada para B3, Pismo ou qualquer outra clearing deverá ser realizada por esse componente.
+Nenhuma Lambda, Event Source Mapping, EventBridge Pipe, SQS ou integração com clearing deverá ser criada por esta história.
+
+---
+
+**CA11**
+
+A execução subsequente de `terraform plan`, sem alteração do código ou das variáveis de infraestrutura, não deverá indicar mudanças inesperadas nos recursos provisionados.
+
+# Fora do escopo
+
+Esta história não contempla:
+
+```text id="w9h0x6"
+Leitura do CSV
+AWS Batch
+
+DynamoDB Streams
+EventBridge Pipes
+
+SQS
+Lambda
+
+Envio para B3
+Retorno Pismo
+
+Regras de transição de status
+Processamento de Registration
+Processamento de Status History
+```
+
+O objetivo desta entrega é exclusivamente disponibilizar, através de Terraform, a infraestrutura DynamoDB necessária para que as próximas etapas da solução possam utilizar o modelo de persistência definido.
