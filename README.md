@@ -87,364 +87,945 @@ terraform destroy
 
 # Título
 
-Criar estrutura de persistência DynamoDB para operações e registros em clearing via Terraform
+Criar estrutura DynamoDB e modelagem PowerDesigner para operações multi-produto e multi-clearing
 
 # Objetivo
 
-Provisionar, através de Terraform, as tabelas Amazon DynamoDB necessárias para persistir as operações recebidas pelo sistema, as informações de registro nas diferentes clearings e o histórico de alterações de status.
+Criar, através de **Terraform**, a estrutura DynamoDB responsável pela persistência das operações processadas pelo sistema de Clearing, incluindo sua respectiva modelagem lógica e física no **PowerDesigner**, conforme normativa corporativa.
 
-A infraestrutura deverá suportar o cenário de **multi-clearing**, permitindo que uma operação seja associada à clearing responsável pelo registro e que seu ciclo de vida possa ser rastreado.
+A solução deverá suportar duas dimensões independentes de evolução:
 
-Esta história contempla exclusivamente a criação e configuração das estruturas DynamoDB e seus recursos de infraestrutura.
+- **Produtos:** inicialmente RDB, posteriormente CDB e futuros produtos;
+- **Clearings:** inicialmente B3, podendo ser adicionadas novas clearings futuramente.
 
-DynamoDB Streams, processamento de eventos, Lambdas, SQS e integrações com clearings não fazem parte desta história.
+Por normativa da empresa, o nome da tabela, atributos, índices, entidades e demais elementos pertencentes à aplicação deverão utilizar nomenclatura em **português**.
+
+A estrutura deverá possuir um **modelo canônico próprio**, independente:
+
+- do formato do CSV;
+- do contrato Kafka;
+- do produto específico;
+- da B3;
+- da Pismo;
+- de futuras fontes;
+- de futuras clearings.
+
+---
 
 # Descrição detalhada
 
-O sistema de registro em clearing necessita de uma estrutura de persistência capaz de armazenar as operações recebidas através das diferentes fontes de entrada e acompanhar posteriormente o processo de registro dessas operações nas clearings.
+## 1. Princípio arquitetural
 
-A infraestrutura deverá ser criada utilizando **Terraform**, seguindo os padrões de infraestrutura como código adotados pelo projeto.
+O sistema de Clearing deverá possuir um modelo de dados próprio.
 
-Inicialmente deverão ser contempladas três estruturas lógicas:
+As fontes externas deverão ser adaptadas para esse modelo antes da persistência.
 
-```text id="9dkt97"
-Operations
+Fluxo conceitual:
 
-Registration
-
-Status History
+```text
+CSV
+ │
+ ▼
+Adaptador CSV
+ │
+ └──────────────┐
+                │
+                ▼
+          MODELO CANÔNICO
+                ▲
+                │
+ ┌──────────────┘
+ │
+Adaptador Kafka
+ ▲
+ │
+Kafka
 ```
 
-A estrutura deverá ser preparada para suportar múltiplas clearings, não existindo dependência fixa da B3 no modelo de dados.
-
-## Operations
-
-Responsável por armazenar os dados da operação recebida pelo sistema.
-
-Modelo lógico inicial:
-
-```text id="fjwrr4"
-PK = OPERATION#<OperationId>
-SK = METADATA
-```
+Dessa forma, alterações no CSV ou Kafka não deverão determinar diretamente alterações no modelo de persistência.
 
 Exemplo:
 
-```text id="ntq5t2"
-PK = OPERATION#123456
-SK = METADATA
+```text
+CSV
 
-OperationId
-OperationType
-Clearing
-Amount
-OperationDate
-
-SourceType
-SourceEventId
-ImportId
-FileName
-
-Status
-
-CreatedAt
-UpdatedAt
+CD_OPERACAO
+TP_MOV
+VL_FINANCEIRO
 ```
 
-O atributo `Clearing` deverá identificar a clearing de destino da operação.
+deverá ser transformado pelo adaptador para conceitos pertencentes ao domínio:
 
-Exemplos:
+```text
+idOperacaoOrigem
+tipoOperacao
+valor
+```
 
-```text id="jy78i5"
+---
+
+# 2. Flexibilidade por produto e clearing
+
+A modelagem deverá considerar **produto e clearing como dimensões independentes**.
+
+Produto caracteriza a operação:
+
+```text
+OPERACAO
+
+produto = RDB
+produto = CDB
+produto = ...
+```
+
+Clearing caracteriza o processo de registro:
+
+```text
+REGISTRO_CLEARING
+
+clearing = B3
+clearing = CLEARING_X
+clearing = ...
+```
+
+Não deverão ser criadas estruturas combinatórias como:
+
+```text
+OPERACAO_RDB_B3
+OPERACAO_CDB_B3
+OPERACAO_RDB_CLEARING_X
+OPERACAO_CDB_CLEARING_X
+```
+
+O relacionamento conceitual deverá ser:
+
+```text
+                    OPERACAO
+                       │
+                 produto = RDB
+                       │
+              dadosProduto {...}
+                       │
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+             ▼                   ▼
+       REGISTRO_CLEARING   REGISTRO_CLEARING
+         clearing=B3        clearing=X
+             │                   │
+       dadosClearing        dadosClearing
+             │                   │
+             ▼                   ▼
+       HISTORICO_STATUS     HISTORICO_STATUS
+```
+
+Isso deverá permitir que novos produtos e novas clearings sejam incorporados sem alteração da estrutura principal de chaves.
+
+---
+
+# 3. Modelo lógico — PowerDesigner
+
+O modelo lógico deverá representar os conceitos de negócio, independentemente da estratégia física de armazenamento utilizada pelo DynamoDB.
+
+Deverão existir três entidades lógicas principais:
+
+```text
+┌─────────────────────────────┐
+│          OPERACAO           │
+├─────────────────────────────┤
+│ # idOperacao                │
+│   tipoOperacao              │
+│   produto                   │
+│   valor                     │
+│   dataOperacao              │
+│   tipoOrigem                │
+│   idOperacaoOrigem          │
+│   idEventoOrigem            │
+│   chaveIdempotencia         │
+│   dadosProduto              │
+│   dataHoraCriacao           │
+│   dataHoraAtualizacao       │
+└──────────────┬──────────────┘
+               │
+             1 │
+               │
+             N │
+               ▼
+┌─────────────────────────────┐
+│      REGISTRO_CLEARING      │
+├─────────────────────────────┤
+│ # idRegistro                │
+│   idOperacao                │
+│   clearing                  │
+│   idExterno                 │
+│   protocoloExterno          │
+│   status                    │
+│   tentativa                 │
+│   codigoUltimoErro          │
+│   descricaoUltimoErro       │
+│   dadosClearing             │
+│   dataHoraEnvio             │
+│   dataHoraRetorno           │
+│   dataHoraCriacao           │
+│   dataHoraAtualizacao       │
+└──────────────┬──────────────┘
+               │
+             1 │
+               │
+             N │
+               ▼
+┌─────────────────────────────┐
+│      HISTORICO_STATUS       │
+├─────────────────────────────┤
+│ # idHistorico               │
+│   idRegistro                │
+│   statusAnterior            │
+│   statusAtual               │
+│   origemAlteracao           │
+│   idEventoExterno           │
+│   protocoloExterno          │
+│   codigoMotivo              │
+│   descricaoMotivo           │
+│   dataHoraCriacao           │
+└─────────────────────────────┘
+```
+
+Relacionamentos:
+
+```text
+OPERACAO
+   1
+   │
+   │ possui
+   │
+   N
+REGISTRO_CLEARING
+   1
+   │
+   │ possui
+   │
+   N
+HISTORICO_STATUS
+```
+
+---
+
+# 4. Domínios do modelo lógico
+
+Deverão ser documentados no PowerDesigner os principais domínios controlados.
+
+## DM_TIPO_OPERACAO
+
+Inicialmente:
+
+```text
+APLICACAO
+RESGATE
+```
+
+Novos tipos poderão ser adicionados futuramente.
+
+## DM_PRODUTO
+
+Inicialmente:
+
+```text
+RDB
+```
+
+Previsto:
+
+```text
+CDB
+```
+
+e demais produtos futuros.
+
+## DM_CLEARING
+
+Inicialmente:
+
+```text
 B3
-CLEARING_X
-CLEARING_Y
 ```
 
-Nenhuma regra da estrutura deverá assumir B3 como única clearing possível.
+Novas clearings poderão ser adicionadas sem alteração da estrutura lógica principal.
 
-`SourceType` deverá permitir identificar a origem da operação, inicialmente:
+## DM_STATUS_REGISTRO
 
-```text id="lmt9xr"
-FILE
-```
+Valores iniciais deverão ser refinados com o domínio.
 
-e futuramente:
+Exemplo conceitual:
 
-```text id="w8okg0"
-KAFKA
-```
-
-A estrutura deverá permitir que novas origens sejam adicionadas sem alteração da chave primária.
-
----
-
-## Registration
-
-Responsável por representar o **estado atual do registro de uma operação em determinada clearing**.
-
-Modelo lógico inicial:
-
-```text id="9yq67h"
-PK = OPERATION#<OperationId>
-
-SK = REGISTRATION#<Clearing>
-```
-
-Exemplo:
-
-```text id="4csn9q"
-PK = OPERATION#123456
-SK = REGISTRATION#B3
-
-OperationId
-Clearing
-
-Status
-Attempt
-
-ExternalProtocol
-RequestHash
-
-LastError
-
-SentAt
-ResponseAt
-CreatedAt
-UpdatedAt
-```
-
-O modelo deverá permitir que uma mesma operação possua registros associados a diferentes clearings caso essa necessidade exista futuramente.
-
-Exemplo:
-
-```text id="5x1vd5"
-OPERATION#123456
-    │
-    ├── METADATA
-    │
-    ├── REGISTRATION#B3
-    │
-    └── REGISTRATION#CLEARING_X
+```text
+RECEBIDO
+PENDENTE
+ENVIADO
+AGUARDANDO_RETORNO
+ACEITO
+REJEITADO
+ERRO
 ```
 
 ---
 
-## Status History
+# 5. Dicionário lógico — OPERACAO
 
-Responsável por manter o histórico das mudanças de status do registro.
+| Campo | Tipo lógico | Obrigatório | Finalidade |
+|---|---|---:|---|
+| `idOperacao` | Identificador | Sim | Identificador único interno da operação |
+| `tipoOperacao` | Domínio | Sim | Aplicação, resgate ou futuro tipo |
+| `produto` | Domínio | Sim | Produto financeiro: RDB, CDB etc. |
+| `valor` | Monetário | A definir | Valor financeiro da operação |
+| `dataOperacao` | Data | A definir | Data da operação |
+| `tipoOrigem` | Domínio | Sim | ARQUIVO, KAFKA ou futura origem |
+| `idOperacaoOrigem` | Texto | A definir | Identificador da operação na origem |
+| `idEventoOrigem` | Texto | Não | Identificador do evento recebido |
+| `chaveIdempotencia` | Texto | A definir | Identificador determinístico para deduplicação |
+| `dadosProduto` | Estrutura | Não | Atributos exclusivos do produto |
+| `dataHoraCriacao` | Data/Hora | Sim | Momento da criação |
+| `dataHoraAtualizacao` | Data/Hora | Sim | Última alteração |
 
-Os registros de histórico deverão ser tratados como **append-only**, evitando sobrescrever o histórico anterior.
+`dadosProduto` deverá conter somente características específicas de determinado produto.
 
-Modelo lógico inicial:
+Caso um atributo seja identificado como conceito comum entre produtos, deverá ser promovido para o modelo canônico da operação.
 
-```text id="2tdrjj"
-PK = OPERATION#<OperationId>
+---
 
-SK =
-REGISTRATION#<Clearing>
-#STATUS#<Timestamp>
-#<EventId>
+# 6. Dicionário lógico — REGISTRO_CLEARING
+
+| Campo | Tipo lógico | Obrigatório | Finalidade |
+|---|---|---:|---|
+| `idRegistro` | Identificador | Sim | Identificador único do registro |
+| `idOperacao` | Identificador | Sim | Operação relacionada |
+| `clearing` | Domínio | Sim | Clearing responsável pelo registro |
+| `idExterno` | Texto | Sim antes do envio | Identificador gerado pelo sistema para correlação |
+| `protocoloExterno` | Texto | Não | Protocolo atribuído pela clearing |
+| `status` | Domínio | Sim | Estado atual do registro |
+| `tentativa` | Inteiro | Sim | Tentativa de processamento/envio |
+| `codigoUltimoErro` | Texto | Não | Código do último erro |
+| `descricaoUltimoErro` | Texto | Não | Descrição do último erro |
+| `dadosClearing` | Estrutura | Não | Dados exclusivos da clearing |
+| `dataHoraEnvio` | Data/Hora | Não | Momento do envio |
+| `dataHoraRetorno` | Data/Hora | Não | Momento do retorno |
+| `dataHoraCriacao` | Data/Hora | Sim | Criação |
+| `dataHoraAtualizacao` | Data/Hora | Sim | Última alteração |
+
+`dadosClearing` deverá conter somente informações realmente específicas de uma clearing.
+
+Conceitos comuns entre diferentes clearings deverão fazer parte do modelo canônico.
+
+---
+
+# 7. Dicionário lógico — HISTORICO_STATUS
+
+| Campo | Tipo lógico | Obrigatório | Finalidade |
+|---|---|---:|---|
+| `idHistorico` | Identificador | Sim | Identificador lógico do evento |
+| `idRegistro` | Identificador | Sim | Registro relacionado |
+| `statusAnterior` | Domínio | Não | Estado anterior |
+| `statusAtual` | Domínio | Sim | Novo estado |
+| `origemAlteracao` | Domínio | Sim | Origem responsável pela alteração |
+| `idEventoExterno` | Texto | Não | Identificador do evento externo |
+| `protocoloExterno` | Texto | Não | Protocolo externo relacionado |
+| `codigoMotivo` | Texto | Não | Código de motivo/rejeição |
+| `descricaoMotivo` | Texto | Não | Descrição do motivo |
+| `dataHoraCriacao` | Data/Hora | Sim | Momento da alteração |
+
+O histórico deverá possuir comportamento **append-only**.
+
+Uma nova alteração de status deverá gerar um novo evento e não sobrescrever o evento anterior.
+
+---
+
+# 8. Modelo físico — PowerDesigner
+
+Embora o modelo lógico possua três entidades, a implementação física utilizará inicialmente uma única tabela DynamoDB utilizando estratégia de **Single Table Design**.
+
+Mapeamento:
+
+```text
+MODELO LÓGICO                      MODELO FÍSICO
+
+OPERACAO ────────────────┐
+                         │
+REGISTRO_CLEARING ───────┼──────► OPERACOES_CLEARING
+                         │           DynamoDB
+HISTORICO_STATUS ────────┘
 ```
+
+A tabela física deverá ser representada no PowerDesigner aproximadamente como:
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│                 OPERACOES_CLEARING                       │
+│                   Amazon DynamoDB                        │
+├──────────────────────────────────────────────────────────┤
+│ PK  chaveParticao                         String         │
+│ SK  chaveOrdenacao                        String         │
+│                                                          │
+│     tipoEntidade                          String         │
+│     idOperacao                            String         │
+│     tipoOperacao                          String         │
+│     produto                               String         │
+│     valor                                 Number         │
+│     dataOperacao                          String         │
+│     tipoOrigem                            String         │
+│     idOperacaoOrigem                      String         │
+│     idEventoOrigem                        String         │
+│     chaveIdempotencia                     String         │
+│     dadosProduto                          Map            │
+│                                                          │
+│     idRegistro                            String         │
+│     clearing                              String         │
+│     idExterno                             String         │
+│     protocoloExterno                      String         │
+│     status                                String         │
+│     tentativa                             Number         │
+│     codigoUltimoErro                      String         │
+│     descricaoUltimoErro                   String         │
+│     dadosClearing                         Map            │
+│     dataHoraEnvio                         String         │
+│     dataHoraRetorno                       String         │
+│                                                          │
+│     statusAnterior                        String         │
+│     statusAtual                           String         │
+│     origemAlteracao                       String         │
+│     idEventoExterno                       String         │
+│     codigoMotivo                          String         │
+│     descricaoMotivo                       String         │
+│                                                          │
+│     dataHoraCriacao                       String         │
+│     dataHoraAtualizacao                   String         │
+│                                                          │
+│ GSI chaveParticaoIndiceIdExterno          String         │
+│ GSI chaveOrdenacaoIndiceIdExterno         String         │
+└──────────────────────────────────────────────────────────┘
+```
+
+Deverá ser adicionada ao modelo físico a seguinte observação:
+
+> **Amazon DynamoDB — Single Table Design:** as entidades lógicas OPERACAO, REGISTRO_CLEARING e HISTORICO_STATUS são armazenadas como diferentes tipos de item na tabela física OPERACOES_CLEARING. A presença dos atributos dependerá do `tipoEntidade`. Apenas atributos pertencentes às chaves primárias e índices compõem obrigatoriamente o schema físico do DynamoDB.
+
+---
+
+# 9. Estrutura física da tabela DynamoDB
+
+Nome lógico:
+
+```text
+OPERACOES_CLEARING
+```
+
+O nome implantado deverá seguir o padrão corporativo por sistema e ambiente.
+
+A tabela deverá possuir:
+
+```text
+Partition Key:
+chaveParticao
+
+Sort Key:
+chaveOrdenacao
+```
+
+Ambas do tipo `String`.
+
+---
+
+# 10. Padrão das chaves
+
+## Operação
+
+```text
+chaveParticao =
+OPERACAO#<idOperacao>
+
+chaveOrdenacao =
+METADADOS
+```
+
+## Registro Clearing
+
+```text
+chaveParticao =
+OPERACAO#<idOperacao>
+
+chaveOrdenacao =
+REGISTRO#<idRegistro>
+```
+
+## Histórico
+
+```text
+chaveParticao =
+OPERACAO#<idOperacao>
+
+chaveOrdenacao =
+REGISTRO#<idRegistro>
+#STATUS#<dataHora>
+#EVENTO#<idEvento>
+```
+
+Exemplo físico:
+
+```text
+chaveParticao = OPERACAO#123
+
+chaveOrdenacao
+───────────────────────────────────────────────────────
+METADADOS
+
+REGISTRO#REG001
+
+REGISTRO#REG001
+#STATUS#2026-09-29T13:31:00Z
+#EVENTO#001
+
+REGISTRO#REG001
+#STATUS#2026-09-29T13:35:00Z
+#EVENTO#002
+```
+
+---
+
+# 11. Estrutura do item OPERACAO
+
+Exemplo de uma aplicação de RDB:
+
+```json
+{
+  "chaveParticao": "OPERACAO#550e8400-e29b-41d4-a716-446655440000",
+  "chaveOrdenacao": "METADADOS",
+
+  "tipoEntidade": "OPERACAO",
+
+  "idOperacao": "550e8400-e29b-41d4-a716-446655440000",
+
+  "tipoOperacao": "APLICACAO",
+  "produto": "RDB",
+
+  "valor": 15000.50,
+  "dataOperacao": "2026-09-29",
+
+  "dadosProduto": {
+    "numeroRdb": "RDB-987654",
+    "dataEmissao": "2026-09-29",
+    "dataVencimento": "2027-09-29",
+    "indexador": "CDI",
+    "taxa": 102.5
+  },
+
+  "tipoOrigem": "ARQUIVO",
+  "idOperacaoOrigem": "987654",
+  "idEventoOrigem": "IMPORTACAO-123#LINHA-456",
+
+  "chaveIdempotencia": "SISTEMA_ORIGEM#987654",
+
+  "dataHoraCriacao": "2026-09-29T13:30:00Z",
+  "dataHoraAtualizacao": "2026-09-29T13:30:00Z"
+}
+```
+
+A futura inclusão de CDB deverá ser possível sem alteração da estrutura de chaves.
+
+Exemplo conceitual:
+
+```json
+{
+  "tipoOperacao": "APLICACAO",
+  "produto": "CDB",
+
+  "valor": 50000,
+
+  "dadosProduto": {
+    "codigoAtivo": "CDB123",
+    "emissor": "BANCO_X",
+    "dataVencimento": "2028-10-10",
+    "indexador": "CDI",
+    "taxa": 101.5
+  }
+}
+```
+
+---
+
+# 12. Estrutura do item REGISTRO_CLEARING
+
+Exemplo de registro da operação na B3:
+
+```json
+{
+  "chaveParticao": "OPERACAO#550e8400-e29b-41d4-a716-446655440000",
+  "chaveOrdenacao": "REGISTRO#82c918b4-79ca-4e4e-922c-22ea74cc7601",
+
+  "tipoEntidade": "REGISTRO_CLEARING",
+
+  "idOperacao": "550e8400-e29b-41d4-a716-446655440000",
+  "idRegistro": "82c918b4-79ca-4e4e-922c-22ea74cc7601",
+
+  "clearing": "B3",
+
+  "idExterno": "CLR-01JXYZ123456",
+  "protocoloExterno": "B3-987654321",
+
+  "status": "ENVIADO",
+  "tentativa": 1,
+
+  "dadosClearing": {
+    "codigoParticipante": "123",
+    "codigoConta": "456789"
+  },
+
+  "codigoUltimoErro": null,
+  "descricaoUltimoErro": null,
+
+  "dataHoraEnvio": "2026-09-29T13:31:30Z",
+  "dataHoraRetorno": null,
+
+  "chaveParticaoIndiceIdExterno": "ID_EXTERNO#CLR-01JXYZ123456",
+  "chaveOrdenacaoIndiceIdExterno": "REGISTRO#82c918b4-79ca-4e4e-922c-22ea74cc7601",
+
+  "dataHoraCriacao": "2026-09-29T13:31:00Z",
+  "dataHoraAtualizacao": "2026-09-29T13:31:30Z"
+}
+```
+
+---
+
+# 13. Estrutura do item HISTORICO_STATUS
 
 Exemplo:
 
-```text id="v6rg9c"
-PK = OPERATION#123456
+```json
+{
+  "chaveParticao": "OPERACAO#550e8400-e29b-41d4-a716-446655440000",
 
-SK =
-REGISTRATION#B3
-#STATUS#2026-09-25T15:30:00
-#EVENT#ABC123
+  "chaveOrdenacao": "REGISTRO#82c918b4#STATUS#2026-09-29T13:35:00.000Z#EVENTO#PISMO-EVT-789",
+
+  "tipoEntidade": "HISTORICO_STATUS",
+
+  "idOperacao": "550e8400-e29b-41d4-a716-446655440000",
+  "idRegistro": "82c918b4-79ca-4e4e-922c-22ea74cc7601",
+
+  "clearing": "B3",
+
+  "statusAnterior": "ENVIADO",
+  "statusAtual": "ACEITO",
+
+  "origemAlteracao": "PISMO",
+
+  "idEventoExterno": "PISMO-EVT-789",
+  "protocoloExterno": "B3-987654321",
+
+  "codigoMotivo": null,
+  "descricaoMotivo": null,
+
+  "dataHoraCriacao": "2026-09-29T13:35:00Z"
+}
 ```
 
-A estrutura deverá permitir armazenar:
+---
 
-```text id="wivpm5"
-PreviousStatus
-Status
+# 14. Estado atual e histórico
 
-Clearing
-
-Reason
-Attempt
-
-ExternalProtocol
-EventId
-
-Source
-
-CreatedAt
-```
-
-O objetivo é permitir posteriormente reconstruir o ciclo de vida de uma operação.
+O item `REGISTRO_CLEARING` deverá possuir o estado atual.
 
 Exemplo:
 
-```text id="w1c7ze"
-RECEIVED
-   ↓
-PENDING
-   ↓
-SENT
-   ↓
-REJECTED
-   ↓
-RETRYING
-   ↓
-SENT
-   ↓
-ACCEPTED
+```text
+status = ACEITO
 ```
 
-A implementação desta história não deverá implementar as regras responsáveis por realizar essas transições.
+O `HISTORICO_STATUS` deverá representar as transições:
+
+```text
+RECEBIDO
+   ↓
+PENDENTE
+   ↓
+ENVIADO
+   ↓
+AGUARDANDO_RETORNO
+   ↓
+ACEITO
+```
+
+O histórico deverá ser append-only.
+
+---
+
+# 15. Índice por identificador externo
+
+Existe um padrão de acesso conhecido para o processamento dos retornos:
+
+```text
+idExterno
+    ↓
+REGISTRO_CLEARING
+    ↓
+idOperacao
+```
+
+Deverá ser criado um Global Secondary Index.
+
+Nome lógico sugerido:
+
+```text
+INDICE_ID_EXTERNO
+```
+
+Estrutura:
+
+```text
+Partition Key:
+
+chaveParticaoIndiceIdExterno
+=
+ID_EXTERNO#<idExterno>
+
+
+Sort Key:
+
+chaveOrdenacaoIndiceIdExterno
+=
+REGISTRO#<idRegistro>
+```
+
+O índice deverá permitir localizar o registro sem executar `Scan`.
+
+Fluxo:
+
+```text
+Pismo / Retorno
+      │
+      │ idExterno
+      ▼
+INDICE_ID_EXTERNO
+      │
+      ▼
+REGISTRO_CLEARING
+      │
+      ├── idOperacao
+      ├── idRegistro
+      ├── clearing
+      └── status
+```
+
+---
+
+# 16. Dicionário físico consolidado
+
+| Campo | Tipo DynamoDB | Operação | Registro | Histórico | Finalidade |
+|---|---|:---:|:---:|:---:|---|
+| `chaveParticao` | String | ✓ | ✓ | ✓ | Partition Key |
+| `chaveOrdenacao` | String | ✓ | ✓ | ✓ | Sort Key |
+| `tipoEntidade` | String | ✓ | ✓ | ✓ | Tipo lógico do item |
+| `idOperacao` | String | ✓ | ✓ | ✓ | Identificador interno da operação |
+| `tipoOperacao` | String | ✓ | | | Aplicação, resgate etc. |
+| `produto` | String | ✓ | | | RDB, CDB e futuros produtos |
+| `valor` | Number | ✓ | | | Valor da operação |
+| `dataOperacao` | String | ✓ | | | Data da operação |
+| `tipoOrigem` | String | ✓ | | | ARQUIVO, KAFKA etc. |
+| `idOperacaoOrigem` | String | ✓ | | | Identificador na origem |
+| `idEventoOrigem` | String | ✓ | | | Evento da origem |
+| `chaveIdempotencia` | String | ✓ | | | Idempotência da entrada |
+| `dadosProduto` | Map | ✓ | | | Dados específicos do produto |
+| `idRegistro` | String | | ✓ | ✓ | Identificador do registro |
+| `clearing` | String | | ✓ | ✓ | Clearing relacionada |
+| `idExterno` | String | | ✓ | | Correlação enviada à clearing |
+| `protocoloExterno` | String | | ✓ | ✓ | Protocolo externo |
+| `status` | String | | ✓ | | Estado atual |
+| `tentativa` | Number | | ✓ | | Tentativa de envio |
+| `dadosClearing` | Map | | ✓ | | Dados específicos da clearing |
+| `codigoUltimoErro` | String | | ✓ | | Último erro |
+| `descricaoUltimoErro` | String | | ✓ | | Descrição do último erro |
+| `dataHoraEnvio` | String | | ✓ | | Momento do envio |
+| `dataHoraRetorno` | String | | ✓ | | Momento do retorno |
+| `statusAnterior` | String | | | ✓ | Estado anterior |
+| `statusAtual` | String | | | ✓ | Novo estado |
+| `origemAlteracao` | String | | | ✓ | Origem da alteração |
+| `idEventoExterno` | String | | | ✓ | Identificação do evento externo |
+| `codigoMotivo` | String | | | ✓ | Código do motivo/rejeição |
+| `descricaoMotivo` | String | | | ✓ | Descrição do motivo |
+| `dataHoraCriacao` | String | ✓ | ✓ | ✓ | Auditoria |
+| `dataHoraAtualizacao` | String | ✓ | ✓ | | Auditoria |
+
+---
+
+# 17. Idempotência
+
+Deverão ser considerados três contextos independentes.
+
+## Entrada
+
+`idOperacao` não deverá ser utilizado como mecanismo de idempotência.
+
+Deverá existir:
+
+```text
+chaveIdempotencia
+```
+
+A composição definitiva será definida após confirmação das garantias fornecidas pelas origens.
+
+Exemplo conceitual:
+
+```text
+<SISTEMA_ORIGEM>#<ID_OPERACAO_ORIGEM>
+```
+
+## Envio para clearing
+
+O `idExterno` deverá ser criado antes do envio e permanecer estável durante retries da mesma solicitação lógica, salvo comportamento específico exigido pela clearing.
+
+## Retorno
+
+Quando disponível deverá ser armazenado:
+
+```text
+idEventoExterno
+```
+
+para identificação de notificações externas duplicadas.
+
+---
+
+# 18. Infraestrutura Terraform
+
+A tabela deverá ser provisionada integralmente através de Terraform.
+
+O recurso deverá contemplar:
+
+- tabela DynamoDB;
+- Partition Key;
+- Sort Key;
+- GSI de identificador externo;
+- configuração de capacidade;
+- criptografia;
+- Point-in-Time Recovery;
+- tags corporativas;
+- outputs necessários.
+
+Deverão ser disponibilizados pelo módulo pelo menos:
+
+```text
+nomeTabela
+arnTabela
+nomeIndiceIdExterno
+```
+
+Importante: atributos como:
+
+```text
+produto
+valor
+status
+dadosProduto
+dadosClearing
+```
+
+não deverão ser declarados no Terraform apenas por existirem no modelo.
+
+No DynamoDB, o Terraform deverá declarar os atributos necessários para:
+
+- chave primária;
+- chave de ordenação;
+- índices.
+
+Os demais atributos pertencem ao contrato da aplicação.
 
 ---
 
 # Requisitos
 
-**RF01 — Infraestrutura como código**
+**RF01 — PowerDesigner**
 
-Todos os recursos DynamoDB deverão ser provisionados exclusivamente através de Terraform.
+Deverão ser criados e/ou atualizados os modelos lógico e físico no PowerDesigner conforme normativa corporativa.
 
-Não deverão ser criados ou configurados recursos manualmente através do AWS Console.
+**RF02 — Modelo lógico**
 
----
+O modelo lógico deverá possuir as entidades:
 
-**RF02 — Ambientes**
-
-A configuração Terraform deverá permitir o provisionamento das estruturas nos ambientes utilizados pelo projeto, seguindo a estratégia existente de configuração por ambiente.
-
-Os nomes físicos dos recursos deverão seguir o padrão corporativo vigente.
-
----
-
-**RF03 — Estrutura de Operations**
-
-Deverá existir estrutura DynamoDB capaz de armazenar uma operação utilizando:
-
-```text id="o20lhc"
-PK = OPERATION#<OperationId>
-SK = METADATA
+```text
+OPERACAO
+REGISTRO_CLEARING
+HISTORICO_STATUS
 ```
 
----
+com relacionamentos 1:N.
 
-**RF04 — Estrutura de Registration**
+**RF03 — Modelo físico**
 
-Deverá existir estrutura capaz de armazenar o estado atual do registro utilizando:
+O modelo físico deverá representar a tabela DynamoDB `OPERACOES_CLEARING` utilizando Single Table Design.
 
-```text id="tyq15v"
-PK = OPERATION#<OperationId>
-SK = REGISTRATION#<Clearing>
-```
+**RF04 — Terraform**
 
----
+A infraestrutura deverá ser criada exclusivamente através de Terraform.
 
-**RF05 — Estrutura de Status History**
+**RF05 — Português**
 
-Deverá existir estrutura capaz de armazenar eventos de histórico utilizando:
+Nomes de tabela, atributos, índices, entidades e elementos pertencentes à aplicação deverão utilizar nomenclatura em português.
 
-```text id="dklh8g"
-PK = OPERATION#<OperationId>
+**RF06 — Modelo canônico**
 
-SK =
-REGISTRATION#<Clearing>
-#STATUS#<Timestamp>
-#<EventId>
-```
+O modelo não deverá reproduzir diretamente contratos de CSV, Kafka, B3 ou Pismo.
 
-A composição da chave deverá impedir que dois eventos distintos ocorridos no mesmo instante sobrescrevam um ao outro.
+**RF07 — Multi-produto**
 
----
+O modelo deverá suportar inicialmente RDB e permitir CDB e futuros produtos sem alteração da estrutura principal de chaves.
 
-**RF06 — Multi-clearing**
+**RF08 — Multi-clearing**
 
-O modelo não deverá possuir dependência estrutural específica da B3.
+O modelo deverá permitir B3 e futuras clearings sem alteração da estrutura principal de chaves.
 
-A clearing deverá fazer parte dos dados/chaves necessárias para identificar o registro.
+**RF09 — Separação produto/clearing**
 
----
+Produto deverá caracterizar a operação e clearing deverá caracterizar o registro.
 
-**RF07 — Capacidade**
+**RF10 — Dados específicos de produto**
 
-O modo de capacidade do DynamoDB deverá ser parametrizável através do Terraform conforme o padrão definido para o projeto.
+Informações exclusivas de determinado produto deverão poder ser armazenadas em `dadosProduto`.
 
-Caso seja utilizado `PAY_PER_REQUEST`, essa configuração deverá estar explícita no módulo.
+**RF11 — Dados específicos de clearing**
 
-Caso seja utilizado provisioned capacity, os valores e eventual autoscaling deverão ser definidos através da infraestrutura como código.
+Informações exclusivas de determinada clearing deverão poder ser armazenadas em `dadosClearing`.
 
----
+**RF12 — Histórico**
 
-**RF08 — Criptografia**
+As alterações de status deverão ser persistidas como eventos append-only.
 
-As tabelas deverão possuir criptografia em repouso habilitada conforme o padrão de segurança da organização.
+**RF13 — Estado atual**
 
-Caso exista uma KMS Key corporativa destinada ao projeto, sua referência deverá ser parametrizada pelo Terraform.
+O estado atual deverá ser mantido no item `REGISTRO_CLEARING`.
 
----
+**RF14 — Correlação**
 
-**RF09 — Point-in-Time Recovery**
+O modelo deverá diferenciar `idExterno` e `protocoloExterno`.
 
-Point-in-Time Recovery deverá ser configurado conforme o padrão de backup e recuperação definido pela organização.
+**RF15 — Idempotência**
 
-A configuração deverá ser realizada através do Terraform.
+A estrutura deverá estar preparada para idempotência de entrada, envio e retorno.
 
----
+**RF16 — Consulta de retorno**
 
-**RF10 — Tags**
+Deverá existir GSI permitindo localizar o registro através de `idExterno` sem utilização de Scan.
 
-Todos os recursos deverão receber as tags corporativas obrigatórias.
+**RF17 — Segurança**
 
-Exemplos, conforme padrão existente:
+Criptografia deverá ser configurada através de Terraform conforme padrão corporativo.
 
-```text id="m1f4qf"
-Environment
-Application
-Team
-CostCenter
-ManagedBy = Terraform
-```
+**RF18 — Recuperação**
 
-Os nomes e valores definitivos deverão utilizar o padrão corporativo vigente.
+Point-in-Time Recovery deverá ser configurado conforme padrão corporativo.
 
----
+**RF19 — Capacidade**
 
-**RF11 — Outputs**
+A configuração deverá considerar o volume esperado de aproximadamente **20 a 30 milhões de operações por arquivo**, com possibilidade de mais de um arquivo por dia e futura entrada através de Kafka.
 
-O módulo Terraform deverá disponibilizar os outputs necessários para consumo pelos demais componentes da solução.
+**RF20 — Streams**
 
-Exemplos:
-
-```text id="s0rw36"
-TableName
-TableArn
-```
-
----
-
-**RF12 — Permissões**
-
-A história não contempla a criação de permissões de aplicação além das necessárias ao provisionamento, salvo quando exigido pelo módulo/padrão Terraform existente.
-
-As policies de acesso dos futuros Batch Jobs, Lambdas e demais consumidores deverão ser tratadas nas histórias correspondentes.
-
----
-
-**RF13 — DynamoDB Streams**
-
-DynamoDB Streams deverá permanecer **desabilitado** nesta entrega.
-
-Não deverão ser criados:
-
-```text id="sp3xk1"
-Stream
-Event Source Mapping
-Lambda de Stream
-EventBridge Pipe
-```
-
-Esses recursos serão tratados posteriormente.
+DynamoDB Streams deverá permanecer desabilitado nesta história.
 
 ---
 
@@ -452,103 +1033,173 @@ Esses recursos serão tratados posteriormente.
 
 **CA01**
 
-Dado o código Terraform da solução,
+O modelo lógico deverá estar disponível no PowerDesigner contendo:
 
-quando `terraform plan` for executado,
-
-então os recursos DynamoDB esperados deverão ser apresentados sem alterações manuais adicionais.
-
----
+```text
+OPERACAO
+    1:N
+REGISTRO_CLEARING
+    1:N
+HISTORICO_STATUS
+```
 
 **CA02**
 
-Dado um ambiente sem os recursos,
-
-quando o Terraform aprovado for aplicado,
-
-então as estruturas DynamoDB deverão ser criadas com sucesso.
-
----
+O modelo lógico deverá representar `produto` como característica da operação e `clearing` como característica do registro.
 
 **CA03**
 
-Dada uma operação,
-
-deverá ser possível representá-la utilizando:
-
-```text id="whl08w"
-PK = OPERATION#<OperationId>
-SK = METADATA
-```
-
----
+O modelo físico deverá representar uma única tabela DynamoDB utilizando Single Table Design.
 
 **CA04**
 
-Dada uma operação registrada em determinada clearing,
-
-deverá ser possível representar seu estado atual utilizando:
-
-```text id="uovl19"
-PK = OPERATION#<OperationId>
-SK = REGISTRATION#<Clearing>
-```
-
----
+O modelo físico deverá documentar os padrões de `chaveParticao` e `chaveOrdenacao`.
 
 **CA05**
 
-Dada uma mudança de status,
+O modelo físico deverá documentar os três tipos de item:
 
-deverá ser possível armazenar múltiplos eventos de histórico para a mesma operação e clearing sem sobrescrever eventos anteriores.
-
----
+```text
+OPERACAO
+REGISTRO_CLEARING
+HISTORICO_STATUS
+```
 
 **CA06**
 
-Dada uma mesma operação,
-
-o modelo deverá permitir representar registros de diferentes clearings sem alteração da estrutura da tabela.
-
----
+O modelo físico deverá documentar o `INDICE_ID_EXTERNO`.
 
 **CA07**
 
-As configurações de capacidade, criptografia, recuperação e tags deverão estar declaradas no Terraform e seguir os padrões definidos para o projeto.
+O Terraform deverá criar a tabela utilizando:
 
----
+```text
+chaveParticao
+chaveOrdenacao
+```
 
 **CA08**
 
-Os outputs necessários para identificação dos recursos, incluindo nome e ARN, deverão estar disponíveis após a aplicação do Terraform.
+Deverá ser possível persistir RDB utilizando:
 
----
+```text
+produto = RDB
+```
+
+sem existir tabela específica para RDB.
 
 **CA09**
 
-Após o provisionamento, nenhuma configuração manual no AWS Console deverá ser necessária para completar a criação das estruturas DynamoDB.
+A inclusão futura de CDB deverá ser possível utilizando:
 
----
+```text
+produto = CDB
+```
+
+sem alteração das chaves da tabela.
 
 **CA10**
 
-Após a aplicação do Terraform, **DynamoDB Streams deverá permanecer desabilitado**.
-
-Nenhuma Lambda, Event Source Mapping, EventBridge Pipe, SQS ou integração com clearing deverá ser criada por esta história.
-
----
+A inclusão de uma nova clearing deverá ser possível sem alteração das chaves da tabela.
 
 **CA11**
 
-A execução subsequente de `terraform plan`, sem alteração do código ou das variáveis de infraestrutura, não deverá indicar mudanças inesperadas nos recursos provisionados.
+Deverá ser possível persistir dados específicos de produto através de `dadosProduto`.
+
+**CA12**
+
+Deverá ser possível persistir dados específicos de clearing através de `dadosClearing`.
+
+**CA13**
+
+Uma operação deverá poder possuir mais de um `REGISTRO_CLEARING`.
+
+**CA14**
+
+Um registro deverá poder possuir múltiplos itens `HISTORICO_STATUS`.
+
+**CA15**
+
+Os eventos históricos não deverão ser sobrescritos por alterações posteriores.
+
+**CA16**
+
+Dado um `idExterno`, deverá ser possível localizar o respectivo registro utilizando o GSI, sem executar Scan.
+
+**CA17**
+
+O modelo deverá distinguir:
+
+```text
+idOperacao
+idRegistro
+idExterno
+protocoloExterno
+chaveIdempotencia
+idEventoExterno
+```
+
+**CA18**
+
+O modelo não deverá possuir dependência estrutural exclusiva de:
+
+```text
+RDB
+B3
+CSV
+Pismo
+```
+
+**CA19**
+
+Ao executar `terraform plan`, deverão ser apresentados os recursos previstos nesta história sem configurações manuais adicionais.
+
+**CA20**
+
+Uma segunda execução de `terraform plan`, sem alterações, não deverá apresentar mudanças inesperadas.
+
+**CA21**
+
+DynamoDB Streams deverá permanecer desabilitado após a implantação desta história.
+
+---
+
+# Decisões pendentes
+
+Os seguintes pontos deverão ser refinados posteriormente:
+
+1. Campos definitivos do modelo canônico da operação;
+2. Campos específicos de RDB;
+3. Campos específicos de CDB;
+4. Identificação de atributos comuns entre diferentes produtos;
+5. Composição definitiva da `chaveIdempotencia`;
+6. Garantias de unicidade fornecidas pelas origens;
+7. Estratégia de idempotência de cada clearing;
+8. Garantia de unicidade do `idEventoExterno` recebido da Pismo;
+9. Status definitivos e transições permitidas;
+10. Necessidade de consultas por produto;
+11. Necessidade de consultas por clearing;
+12. Necessidade de consultas por status;
+13. Necessidade de consultas por período;
+14. Necessidade de consulta por `protocoloExterno`;
+15. Necessidade de novos GSIs.
+
+Novos GSIs deverão ser criados somente após confirmação de padrões reais de acesso, considerando impacto de escrita, armazenamento e custo sobre o volume esperado.
+
+---
 
 # Fora do escopo
 
 Esta história não contempla:
 
-```text id="w9h0x6"
-Leitura do CSV
+```text
 AWS Batch
+leitura do CSV
+
+Kafka Consumer
+
+Adaptador CSV
+Adaptador Kafka
 
 DynamoDB Streams
 EventBridge Pipes
@@ -556,12 +1207,1415 @@ EventBridge Pipes
 SQS
 Lambda
 
-Envio para B3
-Retorno Pismo
+Registration Worker
 
-Regras de transição de status
-Processamento de Registration
-Processamento de Status History
+Adaptador B3
+Adaptador Pismo
+
+envio para clearing
+processamento do retorno
+
+implementação das regras de negócio
+implementação das transições de status
 ```
 
-O objetivo desta entrega é exclusivamente disponibilizar, através de Terraform, a infraestrutura DynamoDB necessária para que as próximas etapas da solução possam utilizar o modelo de persistência definido.
+A entrega desta história deverá disponibilizar:
+
+```text
+1. Modelo lógico PowerDesigner
+2. Modelo físico PowerDesigner
+3. Estrutura DynamoDB
+4. GSI de idExterno
+5. Infraestrutura Terraform
+```
+
+preparando a persistência para as próximas etapas do projeto.
+
+==================================================================
+
+# Título
+
+Processar arquivo de operações e persistir modelo canônico através do AWS Batch
+
+# Objetivo
+
+Implementar um processo de ingestão em **AWS Batch**, desenvolvido em **.NET**, responsável por processar arquivos CSV contendo operações financeiras e persistir essas operações no DynamoDB utilizando o modelo canônico definido pelo sistema de Clearing.
+
+Inicialmente os arquivos conterão operações relacionadas ao produto **RDB**, podendo conter operações de:
+
+- aplicação;
+- resgate.
+
+O processo deverá ser projetado para suportar arquivos de grande volume, atualmente estimados entre **20 e 30 milhões de registros por arquivo**, normalmente recebidos uma vez ao dia, podendo ocorrer duas ou mais execuções conforme necessidade operacional.
+
+O processamento não deverá acoplar o domínio do sistema ao formato do CSV.
+
+O AWS Batch deverá utilizar um **Adaptador CSV** para transformar cada registro recebido no modelo canônico `OPERACAO` antes da persistência.
+
+A arquitetura deverá estar preparada para que futuramente outras fontes, como Kafka, produzam o mesmo modelo canônico sem alterar o domínio de Clearing.
+
+---
+
+# Descrição detalhada
+
+## 1. Contexto
+
+O sistema receberá arquivos CSV contendo operações financeiras que deverão posteriormente ser registradas em uma clearing.
+
+O fluxo inicial será:
+
+```text
+Sistema produtor
+      │
+      │ CSV
+      ▼
+ Amazon S3
+      │
+      │ evento de criação
+      ▼
+ EventBridge
+      │
+      ▼
+  AWS Batch
+      │
+      │ leitura / parse / validação / adaptação
+      ▼
+ Modelo Canônico
+      │
+      ▼
+  DynamoDB
+```
+
+O arquivo será disponibilizado em bucket S3 previamente definido.
+
+A criação do arquivo deverá gerar o evento responsável por iniciar o processo de ingestão.
+
+O EventBridge deverá identificar o evento e iniciar o Job correspondente no AWS Batch.
+
+---
+
+# 2. Responsabilidade do AWS Batch
+
+O AWS Batch será responsável por:
+
+1. receber as informações necessárias para identificar o arquivo no S3;
+2. abrir o arquivo utilizando processamento por streaming;
+3. percorrer os registros sem carregar o arquivo completo em memória;
+4. realizar o parse de cada registro;
+5. validar requisitos mínimos necessários para construção da operação;
+6. transformar o contrato CSV no modelo canônico;
+7. identificar o produto da operação;
+8. construir os atributos específicos do produto;
+9. gerar ou determinar a chave de idempotência;
+10. persistir as operações no DynamoDB;
+11. registrar métricas e logs do processamento;
+12. controlar falhas de registros individuais;
+13. disponibilizar informações suficientes para rastrear o arquivo e a execução;
+14. encerrar a execução indicando sucesso ou falha do processamento.
+
+O Batch não deverá possuir regras de integração com nenhuma clearing.
+
+Portanto, não é responsabilidade desta etapa:
+
+```text
+B3
+Pismo
+Clearing X
+Registration Worker
+envio de operações
+retorno das clearings
+```
+
+---
+
+# 3. Modelo canônico
+
+O formato do CSV não deverá ser persistido diretamente.
+
+O fluxo deverá ser:
+
+```text
+Linha CSV
+   │
+   ▼
+Parse
+   │
+   ▼
+Registro CSV
+   │
+   ▼
+Adaptador CSV
+   │
+   ▼
+Operacao
+Modelo Canônico
+   │
+   ▼
+DynamoDB
+```
+
+Exemplo conceitual de entrada:
+
+```text
+CD_OPERACAO
+TP_MOV
+VL_FINANCEIRO
+CD_PRODUTO
+...
+```
+
+Não deverão ser utilizados diretamente esses nomes no modelo persistido apenas porque fazem parte do contrato externo.
+
+O Adaptador CSV deverá realizar o mapeamento:
+
+```text
+CD_OPERACAO
+      ↓
+idOperacaoOrigem
+
+TP_MOV
+      ↓
+tipoOperacao
+
+VL_FINANCEIRO
+      ↓
+valor
+
+CD_PRODUTO
+      ↓
+produto
+```
+
+O mapeamento definitivo dependerá do layout oficial do arquivo.
+
+---
+
+# 4. Separação de responsabilidades
+
+A implementação deverá manter separadas as responsabilidades de leitura, parsing, adaptação, validação e persistência.
+
+Estrutura conceitual:
+
+```text
+AWS Batch (.NET)
+│
+├── LeitorArquivoS3
+│
+├── ParserCsv
+│
+├── AdaptadorCsv
+│
+├── MapeadorProduto
+│   └── RDB
+│
+├── ValidadorOperacao
+│
+├── GeradorIdempotencia
+│
+├── RepositorioOperacao
+│
+└── Telemetria
+```
+
+O objetivo é evitar que o código responsável pela leitura do arquivo conheça detalhes do DynamoDB ou regras específicas de produto.
+
+---
+
+# 5. Adaptador CSV
+
+O `AdaptadorCsv` será responsável por transformar o contrato externo recebido no modelo utilizado pelo domínio.
+
+Exemplo:
+
+```text
+RegistroCsv
+      │
+      ▼
+AdaptadorCsv
+      │
+      ▼
+Operacao
+```
+
+O Adaptador deverá conhecer o layout do CSV.
+
+O restante do domínio não deverá conhecer:
+
+```text
+posição das colunas;
+nomes das colunas;
+separador;
+formatação específica;
+códigos específicos do arquivo.
+```
+
+Caso futuramente o contrato do arquivo seja alterado, o impacto deverá ficar concentrado no parser/adaptador.
+
+---
+
+# 6. Produto
+
+O processamento deverá identificar o produto associado à operação.
+
+Inicialmente:
+
+```text
+produto = RDB
+```
+
+A arquitetura deverá permitir futuramente:
+
+```text
+produto = CDB
+```
+
+e novos produtos sem necessidade de reescrever o pipeline de ingestão.
+
+O produto deverá ser representado como atributo do modelo canônico.
+
+Exemplo:
+
+```json
+{
+  "tipoOperacao": "APLICACAO",
+  "produto": "RDB"
+}
+```
+
+---
+
+# 7. Dados específicos do produto
+
+Informações realmente específicas de RDB deverão ser armazenadas através da estrutura:
+
+```text
+dadosProduto
+```
+
+Exemplo conceitual:
+
+```json
+{
+  "produto": "RDB",
+
+  "dadosProduto": {
+    "numeroRdb": "RDB-987654",
+    "dataEmissao": "2026-09-29",
+    "dataVencimento": "2027-09-29",
+    "indexador": "CDI",
+    "taxa": 102.5
+  }
+}
+```
+
+Os campos definitivos dependerão do layout do arquivo e da definição do modelo RDB.
+
+`dadosProduto` não deverá ser utilizado indiscriminadamente para atributos que pertencem ao modelo canônico.
+
+Caso determinado atributo seja comum a RDB, CDB e demais produtos, ele deverá ser avaliado como atributo da própria `OPERACAO`.
+
+---
+
+# 8. Modelo persistido
+
+Após adaptação, deverá ser persistido um item do tipo:
+
+```text
+OPERACAO
+```
+
+na tabela:
+
+```text
+OPERACOES_CLEARING
+```
+
+Estrutura física:
+
+```text
+chaveParticao =
+OPERACAO#<idOperacao>
+
+chaveOrdenacao =
+METADADOS
+```
+
+Exemplo:
+
+```json
+{
+  "chaveParticao": "OPERACAO#550e8400-e29b-41d4-a716-446655440000",
+  "chaveOrdenacao": "METADADOS",
+
+  "tipoEntidade": "OPERACAO",
+
+  "idOperacao": "550e8400-e29b-41d4-a716-446655440000",
+
+  "tipoOperacao": "APLICACAO",
+  "produto": "RDB",
+
+  "valor": 15000.50,
+  "dataOperacao": "2026-09-29",
+
+  "dadosProduto": {
+    "numeroRdb": "RDB-987654",
+    "dataEmissao": "2026-09-29",
+    "dataVencimento": "2027-09-29",
+    "indexador": "CDI",
+    "taxa": 102.5
+  },
+
+  "tipoOrigem": "ARQUIVO",
+  "idOperacaoOrigem": "987654",
+  "idEventoOrigem": "ARQUIVO-20260929#LINHA-456",
+
+  "chaveIdempotencia": "SISTEMA_ORIGEM#987654",
+
+  "dataHoraCriacao": "2026-09-29T13:30:00Z",
+  "dataHoraAtualizacao": "2026-09-29T13:30:00Z"
+}
+```
+
+O AWS Batch deverá persistir somente a `OPERACAO`.
+
+A criação de:
+
+```text
+REGISTRO_CLEARING
+HISTORICO_STATUS
+```
+
+não deverá ser responsabilidade desta história, salvo decisão arquitetural posterior em contrário.
+
+---
+
+# 9. Identificação da operação
+
+Cada operação deverá receber:
+
+```text
+idOperacao
+```
+
+como identificador interno do sistema de Clearing.
+
+O identificador deverá ser único.
+
+Inicialmente poderá ser utilizado UUID/GUID.
+
+Exemplo:
+
+```text
+550e8400-e29b-41d4-a716-446655440000
+```
+
+Entretanto, `idOperacao` não deverá ser considerado mecanismo de idempotência.
+
+---
+
+# 10. Rastreabilidade da origem
+
+Toda operação recebida através do arquivo deverá permitir identificar sua origem.
+
+Deverão ser preenchidos, conforme disponibilidade:
+
+| Campo | Finalidade |
+|---|---|
+| `tipoOrigem` | Identifica que a operação veio de arquivo |
+| `idOperacaoOrigem` | Identificador da operação no sistema produtor |
+| `idEventoOrigem` | Identificação do registro/evento específico recebido |
+| `chaveIdempotencia` | Identificação lógica da operação para deduplicação |
+
+Para esta ingestão:
+
+```text
+tipoOrigem = ARQUIVO
+```
+
+O `idEventoOrigem` deverá permitir, sempre que possível, relacionar a operação ao arquivo e registro original.
+
+Exemplo conceitual:
+
+```text
+ARQUIVO#20260929_001#LINHA#000000456
+```
+
+A composição definitiva deverá considerar as informações disponíveis no contrato do arquivo.
+
+---
+
+# 11. Idempotência
+
+O processo deverá ser desenvolvido considerando que:
+
+- o mesmo arquivo pode ser entregue novamente;
+- um job pode falhar após persistir parcialmente o arquivo;
+- um job pode ser reexecutado;
+- uma mesma operação pode aparecer novamente em uma nova execução.
+
+Portanto:
+
+```text
+idOperacao = Guid.NewGuid()
+```
+
+não resolve o problema de duplicidade.
+
+Deverá existir:
+
+```text
+chaveIdempotencia
+```
+
+A composição definitiva dependerá das garantias fornecidas pelo sistema produtor.
+
+Possível exemplo:
+
+```text
+<SISTEMA_ORIGEM>#<ID_OPERACAO_ORIGEM>
+```
+
+ou, caso seja necessário incluir outras dimensões:
+
+```text
+<SISTEMA_ORIGEM>
+#<PRODUTO>
+#<ID_OPERACAO_ORIGEM>
+#<TIPO_OPERACAO>
+```
+
+A composição deverá ser definida com base na identidade real da operação no negócio e não simplesmente pelo número da linha do arquivo.
+
+O número da linha poderá ser utilizado para rastreabilidade, mas não deverá automaticamente ser considerado a identidade da operação.
+
+---
+
+# 12. Persistência idempotente
+
+A implementação deverá evitar que duas execuções concorrentes persistam a mesma operação como registros diferentes.
+
+A estratégia definitiva deverá ser definida juntamente com a modelagem de idempotência.
+
+Deverão ser avaliadas técnicas compatíveis com DynamoDB, como:
+
+```text
+Conditional Write
+
+Item dedicado de idempotência
+
+TransactWriteItems
+```
+
+Não deverá ser implementada uma estratégia baseada em:
+
+```text
+Query
+   ↓
+não encontrou
+   ↓
+Put
+```
+
+como única proteção contra duplicidade, pois duas execuções concorrentes podem realizar a consulta simultaneamente.
+
+---
+
+# 13. Processamento do arquivo
+
+O arquivo poderá possuir aproximadamente:
+
+```text
+20.000.000
+a
+30.000.000
+```
+
+de registros.
+
+O processamento deverá ocorrer de forma streaming.
+
+Não deverá ser realizado:
+
+```text
+File.ReadAllLines()
+```
+
+ou qualquer estratégia equivalente que carregue todo o arquivo em memória.
+
+O comportamento esperado é:
+
+```text
+Abrir stream S3
+      │
+      ▼
+Ler registro
+      │
+      ▼
+Parse
+      │
+      ▼
+Validar
+      │
+      ▼
+Adaptar
+      │
+      ▼
+Persistir
+      │
+      ▼
+Próximo registro
+```
+
+---
+
+# 14. Escrita no DynamoDB
+
+Considerando o volume esperado, não deverá ser realizada necessariamente uma chamada individual ao DynamoDB para cada linha quando houver alternativa mais eficiente.
+
+A implementação deverá avaliar utilização de operações em lote compatíveis com a estratégia de idempotência adotada.
+
+O processamento deverá respeitar:
+
+- limites das APIs do DynamoDB;
+- tamanho máximo de item;
+- throttling;
+- capacidade configurada;
+- retries;
+- backoff;
+- limites de concorrência.
+
+O grau de paralelismo deverá ser configurável.
+
+Não deverá existir paralelismo ilimitado baseado no número total de registros.
+
+---
+
+# 15. Controle de backpressure
+
+O Batch deverá evitar produzir operações para o DynamoDB em velocidade superior à capacidade segura de persistência.
+
+Deverá existir controle de concorrência.
+
+Fluxo esperado:
+
+```text
+S3
+ │
+ ▼
+Leitura
+ │
+ ▼
+Parsing
+ │
+ ▼
+Adaptação
+ │
+ ▼
+Fila interna limitada
+ │
+ ▼
+Workers de persistência
+ │
+ ▼
+DynamoDB
+```
+
+A fila interna deverá possuir tamanho limitado para impedir crescimento descontrolado de memória.
+
+Parâmetros como:
+
+```text
+quantidadeWorkers
+tamanhoBuffer
+tamanhoLote
+numeroMaximoRetries
+```
+
+deverão ser configuráveis.
+
+---
+
+# 16. Falhas transitórias
+
+Falhas transitórias de infraestrutura não deverão automaticamente invalidar uma operação.
+
+Exemplos:
+
+```text
+throttling do DynamoDB;
+timeout;
+falha temporária de rede;
+erro transitório AWS.
+```
+
+Deverá existir política de retry com backoff.
+
+A política deverá possuir quantidade máxima de tentativas para impedir retry infinito.
+
+Após esgotamento das tentativas, a falha deverá ser registrada e tratada conforme estratégia definida para falhas de processamento.
+
+---
+
+# 17. Registro inválido
+
+Uma linha inválida não deverá necessariamente provocar a perda das demais milhões de operações válidas.
+
+Deverão ser diferenciadas:
+
+```text
+falha de negócio/dado
+
+e
+
+falha técnica
+```
+
+Exemplos de dado inválido:
+
+```text
+tipoOperacao inexistente;
+produto não suportado;
+valor inválido;
+data inválida;
+campo obrigatório ausente;
+layout incompatível.
+```
+
+A estratégia deverá permitir identificar:
+
+- arquivo;
+- linha;
+- motivo;
+- campo, quando aplicável.
+
+---
+
+# 18. Tratamento de registros rejeitados
+
+Registros que não possam ser transformados no modelo canônico deverão ser contabilizados como rejeitados.
+
+A implementação deverá permitir rastrear o erro sem depender apenas dos logs da aplicação.
+
+Poderá ser utilizado artefato de saída no S3, conforme padrão definido para o projeto, contendo os registros rejeitados e seus respectivos motivos.
+
+Exemplo conceitual:
+
+```text
+/processados/
+   /2026-09-29/
+      /<idExecucao>/
+         resumo.json
+         rejeitados.csv
+```
+
+A estrutura definitiva do bucket deverá seguir o padrão corporativo.
+
+Dados sensíveis não deverão ser expostos desnecessariamente em arquivos ou logs de erro.
+
+---
+
+# 19. Falha estrutural do arquivo
+
+Erros estruturais deverão poder interromper o processamento.
+
+Exemplos:
+
+```text
+arquivo vazio;
+cabeçalho incompatível;
+versão de layout não suportada;
+encoding inválido;
+arquivo corrompido;
+colunas obrigatórias inexistentes.
+```
+
+Nesses casos, o job deverá ser encerrado como falha e nenhum processamento adicional deverá continuar quando não for possível interpretar o contrato recebido de forma segura.
+
+---
+
+# 20. Identificação do arquivo
+
+Cada execução deverá conhecer pelo menos:
+
+```text
+bucket
+chaveObjeto
+```
+
+Quando disponíveis, também deverão ser utilizados:
+
+```text
+versionId
+eTag
+```
+
+para identificar de forma inequívoca o objeto processado.
+
+Não deverá ser assumido que apenas o nome do arquivo representa necessariamente uma versão única.
+
+---
+
+# 21. Identificação da execução
+
+Cada processamento deverá possuir um identificador de execução.
+
+Exemplo:
+
+```text
+idExecucao
+```
+
+Esse identificador deverá ser utilizado para correlação de:
+
+- logs;
+- métricas;
+- arquivo;
+- registros rejeitados;
+- resumo da execução.
+
+A identificação do AWS Batch Job poderá fazer parte dessa correlação.
+
+---
+
+# 22. Resumo de processamento
+
+Ao final do processamento deverá ser possível obter um resumo semelhante a:
+
+```json
+{
+  "idExecucao": "EXEC-20260929-001",
+  "arquivo": "operacoes-20260929.csv",
+
+  "totalRegistros": 30000000,
+  "totalProcessados": 29999850,
+  "totalPersistidos": 29999700,
+  "totalDuplicados": 100,
+  "totalRejeitados": 50,
+
+  "produto": "RDB",
+
+  "dataHoraInicio": "2026-09-29T10:00:00Z",
+  "dataHoraFim": "2026-09-29T10:42:15Z",
+
+  "status": "CONCLUIDO_COM_REJEICOES"
+}
+```
+
+Os números acima são apenas ilustrativos.
+
+---
+
+# 23. Estados da execução
+
+A execução deverá possuir resultado claramente identificável.
+
+Exemplo conceitual:
+
+```text
+INICIADO
+
+PROCESSANDO
+
+CONCLUIDO
+
+CONCLUIDO_COM_REJEICOES
+
+FALHA
+```
+
+A implementação concreta do controle da execução deverá ser definida conforme padrões de observabilidade do projeto.
+
+---
+
+# 24. Observabilidade
+
+O processo deverá gerar logs estruturados.
+
+Cada log relevante deverá possuir, quando aplicável:
+
+```text
+idExecucao
+bucket
+chaveObjeto
+produto
+tipoOperacao
+idOperacaoOrigem
+idOperacao
+etapa
+```
+
+Não deverão ser registrados payloads completos indiscriminadamente.
+
+Os logs deverão permitir responder perguntas como:
+
+```text
+Qual arquivo foi processado?
+
+Quantas linhas foram lidas?
+
+Quantas operações foram persistidas?
+
+Quantas eram duplicadas?
+
+Quantas foram rejeitadas?
+
+Por que determinada linha falhou?
+
+Quanto tempo o processamento levou?
+
+Houve throttling no DynamoDB?
+
+Houve retries?
+
+Em qual etapa ocorreu a falha?
+```
+
+---
+
+# 25. Métricas
+
+Deverão ser disponibilizadas métricas para acompanhamento do processamento.
+
+No mínimo:
+
+```text
+registrosLidos
+
+registrosValidos
+
+registrosInvalidos
+
+registrosPersistidos
+
+registrosDuplicados
+
+errosPersistencia
+
+retriesDynamoDb
+
+tempoProcessamento
+
+registrosPorSegundo
+```
+
+Também deverá ser possível identificar falha completa do Job.
+
+---
+
+# 26. Segurança
+
+O AWS Batch deverá utilizar IAM Role própria seguindo princípio de menor privilégio.
+
+A role deverá possuir somente as permissões necessárias, incluindo, conforme implementação:
+
+```text
+leitura do bucket/prefixo S3;
+
+escrita no DynamoDB;
+
+escrita de logs/métricas;
+
+acesso a KMS quando necessário;
+
+escrita de artefatos de rejeição/resumo,
+caso essa estratégia seja adotada.
+```
+
+Não deverão ser armazenadas credenciais AWS no código ou configuração da aplicação.
+
+---
+
+# 27. Configuração
+
+Valores operacionais deverão ser externos ao código quando apropriado.
+
+Exemplos:
+
+```text
+nomeTabela
+
+quantidadeWorkers
+
+tamanhoBuffer
+
+tamanhoLote
+
+numeroMaximoRetries
+
+timeout
+
+produto/layout suportado
+```
+
+Configurações específicas por ambiente não deverão exigir recompilação da aplicação.
+
+---
+
+# 28. Infraestrutura como código
+
+Os recursos AWS necessários ao AWS Batch deverão ser provisionados através de **Terraform**, seguindo o padrão corporativo.
+
+Conforme a arquitetura definida, isso poderá contemplar:
+
+```text
+AWS Batch Job Definition
+
+Compute Environment
+
+Job Queue
+
+IAM Roles
+
+CloudWatch Logs
+
+EventBridge Rule / Target
+
+configurações necessárias de rede
+
+Security Groups, quando aplicável
+```
+
+Nenhuma configuração manual deverá ser necessária para implantação normal entre ambientes.
+
+---
+
+# 29. Evolução para novos produtos
+
+O primeiro produto suportado será:
+
+```text
+RDB
+```
+
+Entretanto, a arquitetura deverá permitir posteriormente:
+
+```text
+CDB
+LCI
+LCA
+DEBENTURE
+...
+```
+
+sem duplicação do pipeline inteiro.
+
+Conceitualmente:
+
+```text
+                   CSV
+                    │
+                    ▼
+                Parser CSV
+                    │
+                    ▼
+              Adaptador CSV
+                    │
+                    ▼
+             Modelo Canônico
+                    │
+           ┌────────┼─────────┐
+           │        │         │
+           ▼        ▼         ▼
+          RDB      CDB      Futuro
+```
+
+A inclusão de um novo produto deverá concentrar alterações nas regras/mapeamentos específicos daquele produto, preservando o fluxo genérico de leitura, controle, observabilidade e persistência.
+
+---
+
+# 30. Evolução para Kafka
+
+Futuramente operações também serão recebidas através de Kafka.
+
+O fluxo será conceitualmente:
+
+```text
+CSV ──► Adaptador CSV ───┐
+                         │
+                         ▼
+                   OPERACAO CANÔNICA
+                         ▲
+                         │
+Kafka ► Adaptador Kafka ─┘
+```
+
+O AWS Batch não será responsável por consumir Kafka.
+
+A futura entrada Kafka deverá produzir o mesmo modelo canônico utilizado pelo processamento do arquivo.
+
+Isso significa que o DynamoDB não deverá distinguir estruturalmente uma operação apenas porque ela veio de arquivo ou Kafka.
+
+A origem deverá ser metadata:
+
+```text
+tipoOrigem = ARQUIVO
+```
+
+ou:
+
+```text
+tipoOrigem = KAFKA
+```
+
+---
+
+# Requisitos
+
+**RF01 — AWS Batch**
+
+O processamento do arquivo deverá ser executado através de AWS Batch.
+
+**RF02 — .NET**
+
+A aplicação executada pelo Batch deverá ser desenvolvida em .NET conforme versão homologada pelo projeto.
+
+**RF03 — S3**
+
+O processo deverá consumir o arquivo diretamente do Amazon S3.
+
+**RF04 — EventBridge**
+
+A criação/disponibilização do arquivo deverá iniciar o fluxo através do mecanismo EventBridge definido na arquitetura.
+
+**RF05 — Streaming**
+
+O arquivo deverá ser processado em streaming, sem carregamento integral em memória.
+
+**RF06 — Alto volume**
+
+A solução deverá suportar arquivos da ordem de 20 a 30 milhões de registros.
+
+**RF07 — Modelo canônico**
+
+Nenhum contrato externo deverá ser persistido diretamente como modelo de domínio.
+
+**RF08 — Adaptador**
+
+O contrato CSV deverá ser transformado para o modelo canônico através de componente de adaptação.
+
+**RF09 — Produto**
+
+Cada operação deverá possuir identificação do produto.
+
+Inicialmente:
+
+```text
+RDB
+```
+
+**RF10 — Evolução de produtos**
+
+A arquitetura deverá permitir inclusão futura de CDB e demais produtos sem duplicação do pipeline completo.
+
+**RF11 — Dados de produto**
+
+Dados exclusivos do produto deverão ser armazenados através de `dadosProduto` quando não fizerem parte do modelo canônico.
+
+**RF12 — Tipo da operação**
+
+Deverão ser suportados inicialmente:
+
+```text
+APLICACAO
+RESGATE
+```
+
+**RF13 — Origem**
+
+Operações provenientes do arquivo deverão possuir:
+
+```text
+tipoOrigem = ARQUIVO
+```
+
+**RF14 — Rastreabilidade**
+
+A operação deverá permitir correlação com o registro recebido no arquivo.
+
+**RF15 — Idempotência**
+
+O processamento deverá estar preparado para reexecução do arquivo sem gerar duplicidade de operações.
+
+**RF16 — Concorrência**
+
+A estratégia de idempotência deverá considerar execuções concorrentes.
+
+**RF17 — Persistência**
+
+As operações deverão ser persistidas na tabela `OPERACOES_CLEARING` utilizando o padrão de chave definido no modelo físico.
+
+**RF18 — Backpressure**
+
+O processo deverá possuir limite configurável de concorrência/buffer de persistência.
+
+**RF19 — Retry**
+
+Falhas transitórias deverão possuir política de retry com backoff e limite máximo de tentativas.
+
+**RF20 — Registros inválidos**
+
+Registros inválidos deverão ser identificáveis individualmente.
+
+**RF21 — Falha estrutural**
+
+Arquivos incompatíveis com o layout esperado deverão causar falha controlada da execução.
+
+**RF22 — Observabilidade**
+
+O processo deverá possuir logs estruturados e métricas suficientes para acompanhamento operacional.
+
+**RF23 — Segurança**
+
+O Job deverá utilizar IAM Role com menor privilégio.
+
+**RF24 — Terraform**
+
+A infraestrutura deverá ser provisionada através de Terraform.
+
+**RF25 — Clearing**
+
+O Batch não deverá conter regras específicas de B3 ou qualquer outra clearing.
+
+**RF26 — Registro Clearing**
+
+A criação/processamento de `REGISTRO_CLEARING` não faz parte da responsabilidade deste Job.
+
+**RF27 — Histórico**
+
+A criação de `HISTORICO_STATUS` não faz parte desta história.
+
+---
+
+# Critérios de aceite
+
+**CA01**
+
+Dado um arquivo válido disponibilizado no S3,
+
+quando o evento correspondente for identificado,
+
+então deverá ser iniciado o AWS Batch Job responsável pelo processamento.
+
+**CA02**
+
+O arquivo deverá ser processado em streaming sem carregamento completo em memória.
+
+**CA03**
+
+Cada linha válida deverá ser transformada do contrato CSV para o modelo canônico antes da persistência.
+
+**CA04**
+
+O modelo persistido não deverá utilizar diretamente nomes e estrutura do CSV como contrato principal da operação.
+
+**CA05**
+
+Uma operação RDB deverá ser persistida contendo:
+
+```text
+tipoEntidade = OPERACAO
+produto = RDB
+tipoOrigem = ARQUIVO
+```
+
+**CA06**
+
+Uma operação deverá ser persistida utilizando:
+
+```text
+chaveParticao =
+OPERACAO#<idOperacao>
+
+chaveOrdenacao =
+METADADOS
+```
+
+**CA07**
+
+Cada operação deverá possuir `idOperacao` único.
+
+**CA08**
+
+Cada operação deverá possuir informação suficiente para rastrear sua origem.
+
+**CA09**
+
+A reexecução do mesmo arquivo não deverá gerar novas operações para registros já processados, conforme estratégia de idempotência definida.
+
+**CA10**
+
+Duas execuções concorrentes não deverão conseguir persistir duas representações diferentes da mesma operação lógica.
+
+**CA11**
+
+Uma linha inválida deverá ser identificada com informações suficientes para determinar arquivo, registro e motivo da rejeição.
+
+**CA12**
+
+Uma linha inválida não deverá, isoladamente, interromper o processamento de todas as demais linhas válidas, salvo quando o erro indicar comprometimento estrutural do arquivo.
+
+**CA13**
+
+Um arquivo com layout incompatível deverá provocar falha controlada antes da continuidade do processamento.
+
+**CA14**
+
+Falhas transitórias de persistência deverão executar retry conforme política configurada.
+
+**CA15**
+
+Após esgotamento dos retries, a falha deverá ser registrada e refletida no resultado do processamento.
+
+**CA16**
+
+Ao final da execução deverá ser possível determinar:
+
+```text
+total de registros lidos;
+total válido;
+total persistido;
+total duplicado;
+total rejeitado;
+total de erros de persistência;
+tempo total;
+status final.
+```
+
+**CA17**
+
+Os logs deverão permitir correlacionar uma ocorrência com o arquivo e a execução correspondente.
+
+**CA18**
+
+O nível de paralelismo deverá ser configurável sem alteração do código.
+
+**CA19**
+
+O processo não deverá possuir dependência de contrato específico da B3.
+
+**CA20**
+
+A inclusão futura de uma nova clearing não deverá exigir alteração no processamento do arquivo.
+
+**CA21**
+
+A arquitetura deverá permitir inclusão futura de CDB sem duplicação completa do pipeline de ingestão.
+
+**CA22**
+
+A futura entrada Kafka deverá poder utilizar o mesmo modelo canônico persistido pelo Batch.
+
+**CA23**
+
+O AWS Batch deverá possuir apenas as permissões IAM necessárias para execução de suas responsabilidades.
+
+**CA24**
+
+Os recursos de infraestrutura previstos nesta história deverão estar declarados em Terraform.
+
+**CA25**
+
+Uma nova execução de `terraform plan`, sem alteração de configuração, não deverá apresentar mudanças inesperadas.
+
+---
+
+# Decisões pendentes
+
+Os seguintes pontos deverão ser definidos/refinados antes ou durante o desenvolvimento:
+
+1. layout definitivo do CSV;
+2. separador, encoding e presença de cabeçalho;
+3. campos obrigatórios;
+4. campos canônicos definitivos da operação;
+5. campos específicos de RDB;
+6. mecanismo de identificação do produto no arquivo;
+7. composição definitiva da `chaveIdempotencia`;
+8. garantia de unicidade de `idOperacaoOrigem`;
+9. estratégia definitiva de persistência idempotente no DynamoDB;
+10. tratamento definitivo de registros rejeitados;
+11. localização/formato do relatório de rejeições;
+12. critérios para `CONCLUIDO_COM_REJEICOES` versus `FALHA`;
+13. limites aceitáveis de rejeição;
+14. quantidade inicial de workers;
+15. tamanho do buffer interno;
+16. estratégia de escrita em lote;
+17. capacidade DynamoDB durante a janela de ingestão;
+18. timeout máximo do Job;
+19. política de retry;
+20. alarmes operacionais;
+21. nomenclatura definitiva dos recursos AWS.
+
+---
+
+# Fora do escopo
+
+Esta história não contempla:
+
+```text
+Kafka Consumer
+
+DynamoDB Streams
+
+EventBridge Pipes
+
+SQS de registro
+
+Registration Worker
+
+REGISTRO_CLEARING
+
+HISTORICO_STATUS
+
+Adaptador B3
+
+integração B3
+
+Pismo
+
+SNS de retorno
+
+SQS de retorno
+
+processamento do retorno
+
+regras específicas de clearing
+```
+
+A responsabilidade desta história termina em:
+
+```text
+                ARQUIVO CSV
+                     │
+                     ▼
+                    S3
+                     │
+                     ▼
+                EventBridge
+                     │
+                     ▼
+                AWS Batch
+                     │
+             ┌───────┴────────┐
+             │                │
+             ▼                ▼
+         Parser CSV       Validação
+             │
+             ▼
+        Adaptador CSV
+             │
+             ▼
+       Modelo Canônico
+             │
+       produto = RDB
+             │
+             ▼
+     Idempotência / Persistência
+             │
+             ▼
+           DynamoDB
+             │
+             ▼
+          OPERACAO
+```
+
+O processamento posterior da operação para determinar, preparar e executar o registro na B3 ou em qualquer outra clearing pertence às próximas etapas da arquitetura.
