@@ -84,7 +84,6 @@ Se tudo estiver certo, em alguns segundos as 3 linhas do arquivo devem aparecer 
 terraform destroy
 ```
 
-
 # Título
 
 Criar estrutura DynamoDB para operações de registro em Clearing
