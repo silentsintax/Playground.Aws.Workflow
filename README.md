@@ -92,31 +92,25 @@ Criar estrutura DynamoDB para operações de registro em Clearing
 
 Criar, através de Terraform, a estrutura DynamoDB responsável por armazenar operações financeiras destinadas a registro em clearing, o estado atual do registro e o histórico dos eventos ocorridos durante o processo.
 
-A solução deverá suportar múltiplos produtos e múltiplas clearings, respeitando a seguinte regra de negócio:
+A solução deverá suportar múltiplos produtos e múltiplas clearings, respeitando a regra:
 
 > Cada operação deverá possuir exatamente uma clearing de destino.
 
-O conceito de multi-clearing significa que a plataforma poderá registrar operações em diferentes clearings, mas uma determinada operação pertencerá a apenas uma delas.
+O conceito de multi-clearing significa que a plataforma poderá registrar operações em diferentes clearings, mas cada operação individual será destinada a apenas uma delas.
 
 Exemplo:
 
-```text id="hldctn"
+```text
 OP001 → B3
 OP002 → B3
 OP003 → CLEARING_X
 ```
 
-Não será permitido:
+Inicialmente serão processadas operações de RDB destinadas à B3.
 
-```text id="ifau7b"
-             ┌── B3
-OP001 ───────┤
-             └── CLEARING_X
-```
+O modelo deverá permitir futuramente CDB, novos produtos e novas clearings sem alteração da estrutura principal das chaves.
 
-Inicialmente serão processadas operações de RDB destinadas à B3. O modelo deverá permitir posteriormente CDB, novos produtos e novas clearings sem alteração da estrutura principal de PK/SK.
-
-As operações poderão ter origem em arquivo CSV e, futuramente, Kafka. O modelo persistido deverá ser independente do formato dessas fontes.
+As operações poderão ter origem em arquivo CSV e, futuramente, Kafka. A estrutura persistida deverá ser independente dessas fontes.
 
 ---
 
@@ -126,7 +120,7 @@ As operações poderão ter origem em arquivo CSV e, futuramente, Kafka. O model
 
 O modelo será composto por três entidades:
 
-```text id="nffz8j"
+```text
 OPERACAO
     │
     │ 1:1
@@ -172,21 +166,21 @@ O sistema poderá receber operações através de diferentes fontes.
 
 Inicialmente:
 
-```text id="t3odmn"
+```text
 CSV
 ```
 
 Futuramente:
 
-```text id="imvh1x"
+```text
 Kafka
 ```
 
-As fontes de entrada não deverão determinar a estrutura da persistência.
+As fontes não deverão determinar a estrutura interna de persistência.
 
-Cada entrada deverá ser transformada por seu respectivo adaptador para o modelo canônico do sistema:
+Cada entrada deverá ser transformada por seu respectivo adaptador para o modelo canônico:
 
-```text id="cp1cbp"
+```text
 CSV
  │
  ▼
@@ -204,7 +198,7 @@ Adaptador Kafka
 Kafka
 ```
 
-Dessa forma, mudanças no formato do CSV ou no contrato Kafka não deverão obrigatoriamente alterar o modelo interno de clearing.
+Alterações no formato do CSV ou no contrato Kafka não deverão obrigatoriamente alterar o domínio de clearing.
 
 ---
 
@@ -212,21 +206,19 @@ Dessa forma, mudanças no formato do CSV ou no contrato Kafka não deverão obri
 
 Cada `OPERACAO` deverá possuir exatamente uma clearing de destino.
 
-A relação será:
-
-```text id="r4dvcp"
+```text
 OPERACAO 1 ───────── 1 REGISTRO_CLEARING
 ```
 
-A operação deverá possuir:
+A operação possuirá:
 
-```text id="jxpgxo"
+```text
 clearingDestino
 ```
 
 Exemplo:
 
-```json id="hx9dnv"
+```json
 {
   "idOperacao": "OP-000001",
   "tipoOperacao": "APLICACAO",
@@ -240,380 +232,327 @@ Exemplo:
 
 # 4. Estrutura física DynamoDB
 
-Será utilizada inicialmente uma única tabela física:
+Será utilizada inicialmente uma única tabela:
 
-```text id="1gg6xs"
+```text
 OPERACOES_CLEARING
 ```
 
 utilizando Single Table Design.
 
-A tabela possuirá chave composta:
+A tabela possuirá chave primária composta.
 
-```text id="a1ltsp"
-Partition Key + Sort Key
-```
-
-Os atributos físicos serão:
-
-| Tipo | Campo | Tipo DynamoDB |
+| Conceito DynamoDB | Nome físico | Tipo |
 |---|---|---|
-| Partition Key — PK | `chaveParticao` | String |
-| Sort Key — SK | `chaveOrdenacao` | String |
-
-Portanto:
-
-```text id="bfb50h"
-PK = chaveParticao
-SK = chaveOrdenacao
-```
+| Partition Key | `identificadorAgregado` | String |
+| Sort Key | `chaveEntidade` | String |
 
 ---
 
-# 5. Como funcionam PK e SK neste modelo
+# 5. Funcionamento das chaves
 
-## Partition Key — PK
+## identificadorAgregado — Partition Key
 
-A PK identifica:
+O campo:
 
-> De qual operação estamos falando?
+```text
+identificadorAgregado
+```
 
-Será utilizada:
+responde:
 
-```text id="vxy4fb"
+> De qual operação estes dados fazem parte?
+
+Convenção:
+
+```text
 OPERACAO#<idOperacao>
 ```
 
 Exemplo:
 
-```text id="ooh1o8"
+```text
 OPERACAO#OP-000001
 ```
 
-Todos os itens relacionados à mesma operação possuirão a mesma PK.
+Todos os itens relacionados à operação utilizarão o mesmo `identificadorAgregado`.
 
 ---
 
-## Sort Key — SK
+## chaveEntidade — Sort Key
 
-A SK identifica:
+O campo:
 
-> Qual informação dessa operação este item representa?
-
-Serão utilizadas as seguintes convenções:
-
-### Operação
-
-```text id="pc2s74"
-SK = OPERACAO
+```text
+chaveEntidade
 ```
 
-### Registro atual
+responde:
 
-```text id="5c54aj"
-SK = REGISTRO
-```
+> Qual informação dentro da operação este item representa?
 
-### Eventos
+Convenções:
 
-```text id="tgjw5q"
-SK =
+```text
+OPERACAO
+
+REGISTRO
+
 REGISTRO#EVENTO#<timestamp>#<idEvento>
 ```
 
-Portanto:
+Exemplo:
 
-```text id="7gzrsf"
-PK = OPERACAO#OP001
-│
-├── SK = OPERACAO
-├── SK = REGISTRO
-├── SK = REGISTRO#EVENTO#...#EVT001
-├── SK = REGISTRO#EVENTO#...#EVT002
-└── SK = REGISTRO#EVENTO#...#EVT003
+```text
+identificadorAgregado = OPERACAO#OP-000001
+
+├── chaveEntidade = OPERACAO
+├── chaveEntidade = REGISTRO
+├── chaveEntidade = REGISTRO#EVENTO#...#EVT-001
+├── chaveEntidade = REGISTRO#EVENTO#...#EVT-002
+└── chaveEntidade = REGISTRO#EVENTO#...#EVT-003
 ```
 
-Em termos simples:
+Regra mental:
 
-```text id="84hnv6"
-PK
-"De qual operação é?"
+```text
+identificadorAgregado
+"De qual operação?"
 
-SK
-"O que é dentro dessa operação?"
+chaveEntidade
+"O que é dentro da operação?"
 ```
 
 ---
 
 # 6. Convenção final das chaves
 
-| Entidade | PK | SK |
+| Entidade | identificadorAgregado | chaveEntidade |
 |---|---|---|
-| `OPERACAO` | `OPERACAO#<idOperacao>` | `OPERACAO` |
-| `REGISTRO_CLEARING` | `OPERACAO#<idOperacao>` | `REGISTRO` |
-| `EVENTO_REGISTRO` | `OPERACAO#<idOperacao>` | `REGISTRO#EVENTO#<timestamp>#<idEvento>` |
-
-Essa convenção deverá ser utilizada de forma consistente pela aplicação.
+| OPERACAO | `OPERACAO#<idOperacao>` | `OPERACAO` |
+| REGISTRO_CLEARING | `OPERACAO#<idOperacao>` | `REGISTRO` |
+| EVENTO_REGISTRO | `OPERACAO#<idOperacao>` | `REGISTRO#EVENTO#<timestamp>#<idEvento>` |
 
 ---
 
-# 7. OPERACAO
-
-Representa o fato financeiro recebido pelo sistema.
-
-Exemplos:
-
-```text id="hjnsdv"
-Aplicação de RDB
-Resgate de RDB
-Aplicação de CDB
-Resgate de CDB
-```
-
-Chaves:
-
-```text id="5dt02m"
-PK = OPERACAO#<idOperacao>
-SK = OPERACAO
-```
+# 7. Estrutura da OPERACAO
 
 Principais atributos:
 
 | Campo | Finalidade |
 |---|---|
-| `idOperacao` | Identificador interno |
+| `idOperacao` | Identificador interno da operação |
 | `tipoOperacao` | APLICAÇÃO, RESGATE etc. |
 | `produto` | RDB, CDB etc. |
-| `clearingDestino` | Única clearing da operação |
+| `clearingDestino` | Clearing responsável pelo registro |
 | `valor` | Valor financeiro |
 | `dataOperacao` | Data da operação |
 | `tipoOrigem` | ARQUIVO, KAFKA etc. |
-| `idOperacaoOrigem` | Identificador recebido da origem |
+| `idOperacaoOrigem` | Identificação recebida da origem |
 | `chaveIdempotencia` | Identidade lógica para deduplicação |
-| `dadosProduto` | Informações específicas do produto |
+| `dadosProduto` | Dados específicos do produto |
 | `dataHoraCriacao` | Data/hora de criação |
 
 ---
 
-# 8. REGISTRO_CLEARING
+# 8. Estrutura do REGISTRO_CLEARING
 
 Representa o snapshot atual do processo de registro.
 
-Chaves:
-
-```text id="vujq4j"
-PK = OPERACAO#<idOperacao>
-SK = REGISTRO
-```
-
-Como existe apenas uma clearing por operação, deverá existir no máximo um item `REGISTRO_CLEARING` por operação.
+Como cada operação possuirá uma única clearing, existirá no máximo um `REGISTRO_CLEARING` por operação.
 
 Principais atributos:
 
 | Campo | Finalidade |
 |---|---|
-| `idRegistro` | Identificador interno do registro |
+| `idRegistro` | Identificador interno |
 | `idOperacao` | Operação relacionada |
 | `clearing` | Clearing utilizada |
 | `status` | Estado atual |
-| `idExterno` | Identificador da integração |
-| `protocoloExterno` | Protocolo externo, quando existente |
-| `tentativa` | Controle de tentativas |
+| `idExterno` | Identificador utilizado na integração |
+| `protocoloExterno` | Protocolo retornado pela clearing |
+| `tentativa` | Quantidade/número da tentativa |
 | `dataHoraEnvio` | Momento do envio |
 | `dataHoraRetorno` | Momento do retorno |
 | `dataHoraAtualizacao` | Última atualização |
 
 ---
 
-# 9. EVENTO_REGISTRO
+# 9. Estrutura do EVENTO_REGISTRO
 
-Representa acontecimentos durante o ciclo de vida do registro.
-
-Chaves:
-
-```text id="3x0a7c"
-PK = OPERACAO#<idOperacao>
-
-SK =
-REGISTRO#EVENTO#<timestamp>#<idEvento>
-```
+Representa os fatos ocorridos durante o ciclo de vida do registro.
 
 Principais atributos:
 
 | Campo | Finalidade |
 |---|---|
-| `idEvento` | Identificador único |
+| `idEvento` | Identificador do evento |
 | `idRegistro` | Registro relacionado |
 | `idOperacao` | Operação relacionada |
-| `tipoEvento` | Acontecimento ocorrido |
-| `statusAnterior` | Estado anterior, quando aplicável |
-| `statusAtual` | Estado resultante, quando aplicável |
+| `tipoEvento` | Tipo do acontecimento |
+| `statusAnterior` | Status anterior, quando aplicável |
+| `statusAtual` | Status resultante |
 | `origemEvento` | Origem do acontecimento |
-| `dataHoraEvento` | Momento do evento |
+| `dataHoraEvento` | Data/hora do evento |
 
 Os eventos deverão ser append-only.
 
 ---
 
-# 10. GSI — identificador externo
+# 10. Ordenação dos eventos
 
-Deverá existir inicialmente:
+A Sort Key:
 
-```text id="q98zz6"
+```text
+REGISTRO#EVENTO#<timestamp>#<idEvento>
+```
+
+permite ordenação cronológica.
+
+Exemplo:
+
+```text
+REGISTRO#EVENTO#20261001T100030.000Z#EVT-001
+REGISTRO#EVENTO#20261001T100100.000Z#EVT-002
+REGISTRO#EVENTO#20261001T100500.000Z#EVT-003
+REGISTRO#EVENTO#20261001T100501.000Z#EVT-004
+```
+
+O `idEvento` também garante unicidade caso dois eventos possuam o mesmo timestamp.
+
+---
+
+# 11. Índice por identificador externo
+
+Deverá existir o GSI:
+
+```text
 INDICE_ID_EXTERNO
 ```
 
-com os atributos físicos:
+| Conceito | Campo |
+|---|---|
+| GSI Partition Key | `identificadorExterno` |
+| GSI Sort Key | `identificadorRegistro` |
 
-```text id="rdr41s"
-GSI PK =
-chaveParticaoIndiceIdExterno
+Convenção:
 
-GSI SK =
-chaveOrdenacaoIndiceIdExterno
-```
-
-Para `REGISTRO_CLEARING`:
-
-```text id="i2df4b"
-GSI PK =
+```text
+identificadorExterno =
 ID_EXTERNO#<idExterno>
 
-GSI SK =
+identificadorRegistro =
 REGISTRO#<idOperacao>
 ```
 
 Exemplo:
 
-```text id="f3y36e"
+```text
+identificadorExterno =
 ID_EXTERNO#CLEARING-000001
+
+identificadorRegistro =
 REGISTRO#OP-000001
 ```
 
 Somente itens que possuírem esses atributos participarão do índice.
 
-Inicialmente serão apenas itens `REGISTRO_CLEARING`.
+Inicialmente serão os itens `REGISTRO_CLEARING`.
+
+O índice será, portanto, esparso.
 
 ---
 
-# 11. Padrões de consulta
+# 12. Padrões de consulta
 
 ## AP01 — Buscar operação
 
-```text id="ynodjz"
-PK = OPERACAO#<idOperacao>
-SK = OPERACAO
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = OPERACAO
 ```
-
----
 
 ## AP02 — Buscar registro atual
 
-```text id="3k0gln"
-PK = OPERACAO#<idOperacao>
-SK = REGISTRO
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = REGISTRO
 ```
 
----
+## AP03 — Buscar agregado completo
 
-## AP03 — Buscar operação completa
-
-```text id="kac59d"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
 ```
 
-Retorna:
-
-```text id="rr29q7"
-OPERACAO
-REGISTRO
-EVENTOS
-```
-
----
+Retorna operação, registro atual e eventos.
 
 ## AP04 — Buscar histórico
 
-```text id="7msixg"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
 
-SK begins_with
+chaveEntidade begins_with
 REGISTRO#EVENTO#
 ```
-
----
 
 ## AP05 — Buscar último evento
 
-```text id="hqd5wo"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
 
-SK begins_with
+chaveEntidade begins_with
 REGISTRO#EVENTO#
 
 ScanIndexForward = false
-
 Limit = 1
 ```
 
----
-
 ## AP06 — Buscar pelo identificador externo
 
-No:
+Utilizar:
 
-```text id="n88q9x"
+```text
 INDICE_ID_EXTERNO
 ```
 
-consultar:
+com:
 
-```text id="1eyvyb"
-GSI PK =
+```text
+identificadorExterno =
 ID_EXTERNO#<idExterno>
 ```
 
-Retornando o `REGISTRO_CLEARING` correspondente.
-
 ---
 
-# 12. POC — Massa de dados
+# 13. Massa de dados para POC
 
-A POC deverá possuir inicialmente três cenários distintos:
+A massa abaixo deverá permitir validar os principais padrões de acesso definidos nesta história.
 
-```text id="lv5mcz"
-OP001
-Aplicação RDB
-Arquivo
+Serão criadas duas operações:
+
+```text
+OP-000001
+Aplicação de RDB
 B3
 ACEITO
 
-OP002
-Resgate RDB
-Arquivo
+OP-000002
+Resgate de RDB
 B3
 REJEITADO
-
-OP003
-Aplicação CDB
-Kafka
-CLEARING_X
-PENDENTE
 ```
-
-O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 
 ---
 
-# 13. POC — Cenário 1: aplicação RDB aceita pela B3
+# 14. POC — Operação 1
 
-## OPERACAO
+## 14.1 OPERACAO
 
-```json id="b1gb2n"
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000001",
-  "chaveOrdenacao": "OPERACAO",
-
+  "identificadorAgregado": "OPERACAO#OP-000001",
+  "chaveEntidade": "OPERACAO",
   "tipoEntidade": "OPERACAO",
 
   "idOperacao": "OP-000001",
@@ -626,7 +565,6 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 
   "tipoOrigem": "ARQUIVO",
   "idOperacaoOrigem": "ARQ-987654",
-
   "chaveIdempotencia": "ARQUIVO#ARQ-987654",
 
   "dadosProduto": {
@@ -640,20 +578,20 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 }
 ```
 
-## REGISTRO_CLEARING
+---
 
-```json id="3y2igq"
+## 14.2 REGISTRO_CLEARING
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000001",
-  "chaveOrdenacao": "REGISTRO",
-
+  "identificadorAgregado": "OPERACAO#OP-000001",
+  "chaveEntidade": "REGISTRO",
   "tipoEntidade": "REGISTRO_CLEARING",
 
   "idOperacao": "OP-000001",
   "idRegistro": "REG-000001",
 
   "clearing": "B3",
-
   "status": "ACEITO",
 
   "idExterno": "CLEARING-000001",
@@ -661,26 +599,24 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 
   "tentativa": 1,
 
-  "chaveParticaoIndiceIdExterno":
-    "ID_EXTERNO#CLEARING-000001",
+  "identificadorExterno": "ID_EXTERNO#CLEARING-000001",
+  "identificadorRegistro": "REGISTRO#OP-000001",
 
-  "chaveOrdenacaoIndiceIdExterno":
-    "REGISTRO#OP-000001",
-
+  "dataHoraCriacao": "2026-10-01T10:00:30Z",
   "dataHoraEnvio": "2026-10-01T10:01:00Z",
   "dataHoraRetorno": "2026-10-01T10:05:00Z",
   "dataHoraAtualizacao": "2026-10-01T10:05:01Z"
 }
 ```
 
-## EVENTO — criado
+---
 
-```json id="pf4i73"
+## 14.3 EVENTO — Registro criado
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000001",
-  "chaveOrdenacao":
-    "REGISTRO#EVENTO#20261001T100030.000Z#EVT-001",
-
+  "identificadorAgregado": "OPERACAO#OP-000001",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T100030.000Z#EVT-001",
   "tipoEntidade": "EVENTO_REGISTRO",
 
   "idOperacao": "OP-000001",
@@ -691,19 +627,18 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
   "statusAtual": "PENDENTE",
 
   "origemEvento": "SISTEMA_CLEARING",
-
   "dataHoraEvento": "2026-10-01T10:00:30Z"
 }
 ```
 
-## EVENTO — enviado
+---
 
-```json id="smg3e4"
+## 14.4 EVENTO — Envio realizado
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000001",
-  "chaveOrdenacao":
-    "REGISTRO#EVENTO#20261001T100100.000Z#EVT-002",
-
+  "identificadorAgregado": "OPERACAO#OP-000001",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T100100.000Z#EVT-002",
   "tipoEntidade": "EVENTO_REGISTRO",
 
   "idOperacao": "OP-000001",
@@ -717,18 +652,21 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 
   "origemEvento": "REGISTRATION_WORKER",
 
+  "tentativa": 1,
+  "idExterno": "CLEARING-000001",
+
   "dataHoraEvento": "2026-10-01T10:01:00Z"
 }
 ```
 
-## EVENTO — retorno recebido
+---
 
-```json id="wruee1"
+## 14.5 EVENTO — Retorno recebido
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000001",
-  "chaveOrdenacao":
-    "REGISTRO#EVENTO#20261001T100500.000Z#EVT-003",
-
+  "identificadorAgregado": "OPERACAO#OP-000001",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T100500.000Z#EVT-003",
   "tipoEntidade": "EVENTO_REGISTRO",
 
   "idOperacao": "OP-000001",
@@ -740,19 +678,21 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
   "origemEvento": "PISMO",
 
   "idEventoExterno": "PISMO-EVT-789",
+  "idExterno": "CLEARING-000001",
+  "protocoloExterno": "B3-PROT-987654",
 
   "dataHoraEvento": "2026-10-01T10:05:00Z"
 }
 ```
 
-## EVENTO — aceito
+---
 
-```json id="6khy81"
+## 14.6 EVENTO — Operação aceita
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000001",
-  "chaveOrdenacao":
-    "REGISTRO#EVENTO#20261001T100501.000Z#EVT-004",
-
+  "identificadorAgregado": "OPERACAO#OP-000001",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T100501.000Z#EVT-004",
   "tipoEntidade": "EVENTO_REGISTRO",
 
   "idOperacao": "OP-000001",
@@ -766,21 +706,26 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 
   "origemEvento": "RETORNO_CLEARING",
 
+  "idEventoExterno": "PISMO-EVT-789",
+  "idExterno": "CLEARING-000001",
+  "protocoloExterno": "B3-PROT-987654",
+
   "dataHoraEvento": "2026-10-01T10:05:01Z"
 }
 ```
 
 ---
 
-# 14. POC — Cenário 2: resgate RDB rejeitado
+# 15. POC — Operação 2
 
-## OPERACAO
+A segunda operação deverá permitir validar que diferentes operações permanecem isoladas através do `identificadorAgregado`.
 
-```json id="8b5kmj"
+## 15.1 OPERACAO
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000002",
-  "chaveOrdenacao": "OPERACAO",
-
+  "identificadorAgregado": "OPERACAO#OP-000002",
+  "chaveEntidade": "OPERACAO",
   "tipoEntidade": "OPERACAO",
 
   "idOperacao": "OP-000002",
@@ -788,12 +733,11 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
   "produto": "RDB",
   "clearingDestino": "B3",
 
-  "valor": 8000.00,
+  "valor": 8500.00,
   "dataOperacao": "2026-10-01",
 
   "tipoOrigem": "ARQUIVO",
   "idOperacaoOrigem": "ARQ-987655",
-
   "chaveIdempotencia": "ARQUIVO#ARQ-987655",
 
   "dadosProduto": {
@@ -804,49 +748,98 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 }
 ```
 
-## REGISTRO_CLEARING
+---
 
-```json id="wdv45v"
+## 15.2 REGISTRO_CLEARING
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000002",
-  "chaveOrdenacao": "REGISTRO",
-
+  "identificadorAgregado": "OPERACAO#OP-000002",
+  "chaveEntidade": "REGISTRO",
   "tipoEntidade": "REGISTRO_CLEARING",
 
   "idOperacao": "OP-000002",
   "idRegistro": "REG-000002",
 
   "clearing": "B3",
-
   "status": "REJEITADO",
 
   "idExterno": "CLEARING-000002",
-
-  "tentativa": 1,
+  "protocoloExterno": "B3-PROT-123456",
 
   "codigoRetorno": "B3-001",
   "descricaoRetorno": "Operacao rejeitada pela clearing",
 
-  "chaveParticaoIndiceIdExterno":
-    "ID_EXTERNO#CLEARING-000002",
+  "tentativa": 1,
 
-  "chaveOrdenacaoIndiceIdExterno":
-    "REGISTRO#OP-000002",
+  "identificadorExterno": "ID_EXTERNO#CLEARING-000002",
+  "identificadorRegistro": "REGISTRO#OP-000002",
 
+  "dataHoraCriacao": "2026-10-01T11:00:30Z",
   "dataHoraEnvio": "2026-10-01T11:01:00Z",
   "dataHoraRetorno": "2026-10-01T11:04:00Z",
   "dataHoraAtualizacao": "2026-10-01T11:04:01Z"
 }
 ```
 
-## EVENTO — rejeitado
+---
 
-```json id="5cl28p"
+## 15.3 EVENTO — Registro criado
+
+```json
 {
-  "chaveParticao": "OPERACAO#OP-000002",
-  "chaveOrdenacao":
-    "REGISTRO#EVENTO#20261001T110401.000Z#EVT-103",
+  "identificadorAgregado": "OPERACAO#OP-000002",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T110030.000Z#EVT-101",
+  "tipoEntidade": "EVENTO_REGISTRO",
 
+  "idOperacao": "OP-000002",
+  "idRegistro": "REG-000002",
+  "idEvento": "EVT-101",
+
+  "tipoEvento": "REGISTRO_CRIADO",
+  "statusAtual": "PENDENTE",
+
+  "origemEvento": "SISTEMA_CLEARING",
+  "dataHoraEvento": "2026-10-01T11:00:30Z"
+}
+```
+
+---
+
+## 15.4 EVENTO — Enviado
+
+```json
+{
+  "identificadorAgregado": "OPERACAO#OP-000002",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T110100.000Z#EVT-102",
+  "tipoEntidade": "EVENTO_REGISTRO",
+
+  "idOperacao": "OP-000002",
+  "idRegistro": "REG-000002",
+  "idEvento": "EVT-102",
+
+  "tipoEvento": "ENVIO_REALIZADO",
+
+  "statusAnterior": "PENDENTE",
+  "statusAtual": "ENVIADO",
+
+  "origemEvento": "REGISTRATION_WORKER",
+
+  "tentativa": 1,
+  "idExterno": "CLEARING-000002",
+
+  "dataHoraEvento": "2026-10-01T11:01:00Z"
+}
+```
+
+---
+
+## 15.5 EVENTO — Rejeitado
+
+```json
+{
+  "identificadorAgregado": "OPERACAO#OP-000002",
+  "chaveEntidade": "REGISTRO#EVENTO#20261001T110401.000Z#EVT-103",
   "tipoEntidade": "EVENTO_REGISTRO",
 
   "idOperacao": "OP-000002",
@@ -858,10 +851,13 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
   "statusAnterior": "ENVIADO",
   "statusAtual": "REJEITADO",
 
+  "origemEvento": "RETORNO_CLEARING",
+
+  "idExterno": "CLEARING-000002",
+  "protocoloExterno": "B3-PROT-123456",
+
   "codigoRetorno": "B3-001",
   "descricaoRetorno": "Operacao rejeitada pela clearing",
-
-  "origemEvento": "RETORNO_CLEARING",
 
   "dataHoraEvento": "2026-10-01T11:04:01Z"
 }
@@ -869,420 +865,135 @@ O terceiro cenário tem como objetivo validar a flexibilidade futura do modelo.
 
 ---
 
-# 15. POC — Cenário 3: futura operação Kafka/CDB
+# 16. Validações da POC
 
-Este cenário será utilizado somente para validar que o modelo não está acoplado a:
+Após inserir os itens, deverão ser executados os seguintes testes.
 
-```text id="l2ab8i"
-RDB
-+
-CSV
-+
-B3
+| Teste | Consulta | Resultado esperado |
+|---|---|---|
+| Buscar operação | `OP-000001 + OPERACAO` | Aplicação RDB |
+| Buscar registro | `OP-000001 + REGISTRO` | Status ACEITO |
+| Agregado completo | `OPERACAO#OP-000001` | 6 itens |
+| Histórico | `begins_with(REGISTRO#EVENTO#)` | 4 eventos |
+| Último evento | Histórico descendente + Limit 1 | EVT-004 / ACEITO |
+| ID externo | `ID_EXTERNO#CLEARING-000001` | REG-000001 |
+| Segunda operação | `OPERACAO#OP-000002` | 5 itens |
+| Segundo ID externo | `ID_EXTERNO#CLEARING-000002` | REG-000002 |
+
+Para a primeira operação, uma Query somente por:
+
+```text
+identificadorAgregado =
+OPERACAO#OP-000001
 ```
 
-## OPERACAO
+deverá apresentar:
 
-```json id="ehtm6q"
-{
-  "chaveParticao": "OPERACAO#OP-000003",
-  "chaveOrdenacao": "OPERACAO",
-
-  "tipoEntidade": "OPERACAO",
-
-  "idOperacao": "OP-000003",
-  "tipoOperacao": "APLICACAO",
-
-  "produto": "CDB",
-
-  "clearingDestino": "CLEARING_X",
-
-  "valor": 25000.00,
-  "dataOperacao": "2026-10-01",
-
-  "tipoOrigem": "KAFKA",
-  "idOperacaoOrigem": "KAFKA-123456",
-
-  "chaveIdempotencia": "KAFKA#KAFKA-123456",
-
-  "dadosProduto": {
-    "codigoCdb": "CDB-000123",
-    "indexador": "CDI",
-    "taxa": 105.0
-  },
-
-  "dataHoraCriacao": "2026-10-01T12:00:00Z"
-}
-```
-
-## REGISTRO_CLEARING
-
-```json id="y42n4m"
-{
-  "chaveParticao": "OPERACAO#OP-000003",
-  "chaveOrdenacao": "REGISTRO",
-
-  "tipoEntidade": "REGISTRO_CLEARING",
-
-  "idOperacao": "OP-000003",
-  "idRegistro": "REG-000003",
-
-  "clearing": "CLEARING_X",
-
-  "status": "PENDENTE",
-
-  "tentativa": 0,
-
-  "dataHoraAtualizacao": "2026-10-01T12:00:01Z"
-}
-```
-
-Nesse momento ainda não existe `idExterno`.
-
-Consequentemente, esse item ainda não participa do:
-
-```text id="g2dyhf"
-INDICE_ID_EXTERNO
-```
-
-Isso demonstra também o comportamento de índice esparso.
-
----
-
-# 16. POC — Cenários de consulta
-
-A POC deverá validar os seguintes cenários.
-
-## Cenário A — localizar somente a operação
-
-Objetivo:
-
-> Quero os dados financeiros da OP-000001.
-
-Consulta:
-
-```text id="smg40p"
-PK = OPERACAO#OP-000001
-SK = OPERACAO
-```
-
-Resultado esperado:
-
-```text id="26nv2d"
-tipoOperacao = APLICACAO
-produto = RDB
-clearingDestino = B3
-valor = 15000.50
-```
-
----
-
-## Cenário B — localizar estado atual do registro
-
-Objetivo:
-
-> Como está atualmente a OP-000001 na clearing?
-
-Consulta:
-
-```text id="ocnuxk"
-PK = OPERACAO#OP-000001
-SK = REGISTRO
-```
-
-Resultado:
-
-```text id="k90uj7"
-clearing = B3
-status = ACEITO
-idExterno = CLEARING-000001
-```
-
----
-
-## Cenário C — carregar tudo da operação
-
-Objetivo:
-
-> Quero investigar completamente a OP-000001.
-
-Consulta:
-
-```text id="o7i5e9"
-PK = OPERACAO#OP-000001
-```
-
-Resultado esperado:
-
-```text id="0iqab9"
-OPERACAO
-REGISTRO
-REGISTRO_CRIADO
-ENVIO_REALIZADO
-RETORNO_RECEBIDO
-STATUS_ALTERADO
-```
-
-Esse padrão é particularmente útil para troubleshooting.
-
----
-
-## Cenário D — consultar somente timeline
-
-Objetivo:
-
-> Quero saber tudo que aconteceu durante o registro.
-
-Consulta:
-
-```text id="14s4aq"
-PK = OPERACAO#OP-000001
-
-SK begins_with
-REGISTRO#EVENTO#
-```
-
-Resultado:
-
-```text id="9q11rp"
-10:00:30 REGISTRO_CRIADO
-10:01:00 ENVIO_REALIZADO
-10:05:00 RETORNO_RECEBIDO
-10:05:01 STATUS_ALTERADO → ACEITO
-```
-
----
-
-## Cenário E — consultar último evento
-
-Objetivo:
-
-> Qual foi o último acontecimento?
-
-Consulta:
-
-```text id="njzpcq"
-PK = OPERACAO#OP-000001
-
-SK begins_with
-REGISTRO#EVENTO#
-
-ScanIndexForward = false
-
-Limit = 1
-```
-
-Resultado:
-
-```text id="cxkq6n"
-STATUS_ALTERADO
-ENVIADO → ACEITO
-```
-
----
-
-## Cenário F — localizar operação a partir do retorno externo
-
-Objetivo:
-
-A Pismo enviou:
-
-```text id="svyjg9"
-idExterno = CLEARING-000001
-```
-
-e o processador precisa descobrir a operação.
-
-Consulta:
-
-```text id="f9sk22"
-INDEX =
-INDICE_ID_EXTERNO
-
-PK =
-ID_EXTERNO#CLEARING-000001
-```
-
-Resultado:
-
-```text id="4h5sbj"
-REGISTRO_CLEARING
-
-idOperacao = OP-000001
-idRegistro = REG-000001
-status = ACEITO
-```
-
-Fluxo validado:
-
-```text id="oh00xl"
-Pismo
-   │
-   │ idExterno
-   ▼
-SQS Retorno
-   │
-   ▼
-Processador
-   │
-   ▼
-INDICE_ID_EXTERNO
-   │
-   ▼
-REGISTRO
-   │
-   ▼
-OP-000001
-```
-
----
-
-# 17. POC — Queries AWS CLI de referência
-
-As queries abaixo são apenas referências técnicas para documentação e desenvolvimento.
-
-Não é necessário utilizar AWS CLI para executar a POC pelo Console.
-
-## Buscar operação completa
-
-```bash id="45c8vu"
-aws dynamodb query \
-  --table-name OPERACOES_CLEARING \
-  --key-condition-expression \
-    "chaveParticao = :pk" \
-  --expression-attribute-values '{
-    ":pk": {
-      "S": "OPERACAO#OP-000001"
-    }
-  }'
-```
-
----
-
-## Buscar somente o histórico
-
-```bash id="nmdkmf"
-aws dynamodb query \
-  --table-name OPERACOES_CLEARING \
-  --key-condition-expression \
-    "chaveParticao = :pk AND begins_with(chaveOrdenacao, :sk)" \
-  --expression-attribute-values '{
-    ":pk": {
-      "S": "OPERACAO#OP-000001"
-    },
-    ":sk": {
-      "S": "REGISTRO#EVENTO#"
-    }
-  }'
-```
-
----
-
-## Buscar último evento
-
-```bash id="a8xwnn"
-aws dynamodb query \
-  --table-name OPERACOES_CLEARING \
-  --key-condition-expression \
-    "chaveParticao = :pk AND begins_with(chaveOrdenacao, :sk)" \
-  --expression-attribute-values '{
-    ":pk": {
-      "S": "OPERACAO#OP-000001"
-    },
-    ":sk": {
-      "S": "REGISTRO#EVENTO#"
-    }
-  }' \
-  --no-scan-index-forward \
-  --limit 1
-```
-
----
-
-## Buscar pelo idExterno
-
-```bash id="5l4qnt"
-aws dynamodb query \
-  --table-name OPERACOES_CLEARING \
-  --index-name INDICE_ID_EXTERNO \
-  --key-condition-expression \
-    "chaveParticaoIndiceIdExterno = :pk" \
-  --expression-attribute-values '{
-    ":pk": {
-      "S": "ID_EXTERNO#CLEARING-000001"
-    }
-  }'
-```
-
----
-
-# 18. POC — Resultado visual esperado
-
-Após inserir os itens, a OP-000001 deverá aparecer conceitualmente:
-
-```text id="tib1y6"
+```text
 OPERACAO#OP-000001
 │
 ├── OPERACAO
-│     APLICACAO
-│     RDB
-│     R$ 15.000,50
-│     B3
 │
 ├── REGISTRO
-│     B3
-│     ACEITO
-│     CLEARING-000001
 │
-├── REGISTRO#EVENTO#...#EVT-001
-│     REGISTRO_CRIADO
+├── REGISTRO#EVENTO#20261001T100030.000Z#EVT-001
 │
-├── REGISTRO#EVENTO#...#EVT-002
-│     ENVIO_REALIZADO
+├── REGISTRO#EVENTO#20261001T100100.000Z#EVT-002
 │
-├── REGISTRO#EVENTO#...#EVT-003
-│     RETORNO_RECEBIDO
+├── REGISTRO#EVENTO#20261001T100500.000Z#EVT-003
 │
-└── REGISTRO#EVENTO#...#EVT-004
-      STATUS_ALTERADO
-      ACEITO
+└── REGISTRO#EVENTO#20261001T100501.000Z#EVT-004
 ```
+
+Isso deverá comprovar que operação, estado atual e histórico estão agrupados no mesmo agregado.
 
 ---
 
-# 19. O que a POC deverá provar
+# 17. Flexibilidade por produto
 
-A POC deverá demonstrar que:
+Dados particulares do produto deverão ficar em:
 
-1. Operação, registro atual e histórico podem coexistir na mesma tabela.
+```text
+dadosProduto
+```
 
-2. A PK agrupa todos os dados relacionados à mesma operação.
+Exemplo RDB:
 
-3. A SK permite identificar e consultar seletivamente cada tipo de informação.
+```json
+{
+  "produto": "RDB",
+  "dadosProduto": {
+    "numeroRdb": "RDB-987654",
+    "indexador": "CDI",
+    "taxa": 102.5
+  }
+}
+```
 
-4. É possível obter somente a operação.
+Exemplo futuro CDB:
 
-5. É possível obter somente o snapshot atual do registro.
+```json
+{
+  "produto": "CDB",
+  "dadosProduto": {
+    "codigoCdb": "CDB-123456",
+    "indexador": "CDI",
+    "taxa": 105.0
+  }
+}
+```
 
-6. É possível recuperar toda a operação e seu histórico com uma Query pela PK.
+A inclusão de novos produtos não deverá exigir alteração de `identificadorAgregado` ou `chaveEntidade`.
 
-7. É possível recuperar somente a timeline utilizando prefixo da SK.
+---
 
-8. É possível recuperar o último evento sem ler toda a timeline.
+# 18. Flexibilidade por clearing
 
-9. O retorno externo pode localizar o registro através do `INDICE_ID_EXTERNO`.
+Conceitualmente:
 
-10. O modelo suporta operação originada de arquivo ou Kafka.
+```text
+OPERACAO
+    │
+    │ clearingDestino
+    ▼
+Roteamento
+    │
+    ├── B3 → Adaptador B3
+    ├── X  → Adaptador X
+    └── Y  → Adaptador Y
+```
 
-11. O modelo suporta RDB, CDB e futuros produtos sem alterar PK/SK.
+A inclusão de uma nova clearing não deverá exigir alteração da estrutura das chaves.
 
-12. O modelo suporta B3 e futuras clearings sem alterar PK/SK.
+---
 
-13. Uma operação pertence a apenas uma clearing.
+# 19. Idempotência
 
-14. `EVENTO_REGISTRO` pode permanecer append-only enquanto `REGISTRO_CLEARING` representa o estado atual.
+O processamento deverá considerar:
 
-15. Itens que ainda não possuem `idExterno` não precisam participar do GSI.
+- reprocessamento do mesmo arquivo;
+- mensagens duplicadas;
+- reexecução após falha parcial;
+- processamento concorrente;
+- futura entrada através de Kafka.
+
+O campo:
+
+```text
+chaveIdempotencia
+```
+
+representará a identidade lógica utilizada para deduplicação.
+
+Exemplo:
+
+```text
+ARQUIVO#ARQ-987654
+```
+
+Um GUID aleatório utilizado como `idOperacao`, isoladamente, não deverá ser considerado garantia de idempotência.
+
+A estratégia definitiva deverá considerar as garantias fornecidas pelos sistemas produtores.
 
 ---
 
@@ -1292,90 +1003,97 @@ A POC deverá demonstrar que:
 
 Deverá existir:
 
-```text id="hgt8xl"
+```text
 OPERACOES_CLEARING
 ```
 
-**RF02 — Chave física**
+**RF02 — Partition Key**
 
-```text id="n3fwl3"
-PK = chaveParticao
-SK = chaveOrdenacao
+```text
+identificadorAgregado
 ```
 
-ambas do tipo String.
+String.
 
-**RF03 — OPERACAO**
+**RF03 — Sort Key**
 
-```text id="y39oeq"
-PK = OPERACAO#<idOperacao>
-SK = OPERACAO
+```text
+chaveEntidade
 ```
 
-**RF04 — REGISTRO_CLEARING**
+String.
 
-```text id="xq3u7e"
-PK = OPERACAO#<idOperacao>
-SK = REGISTRO
+**RF04 — OPERACAO**
+
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = OPERACAO
 ```
 
-**RF05 — EVENTO_REGISTRO**
+**RF05 — REGISTRO_CLEARING**
 
-```text id="pyyp8v"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = REGISTRO
+```
 
-SK =
+**RF06 — EVENTO_REGISTRO**
+
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+
+chaveEntidade =
 REGISTRO#EVENTO#<timestamp>#<idEvento>
 ```
 
-**RF06 — Clearing única**
+**RF07 — Clearing única**
 
 Cada operação deverá possuir exatamente uma clearing de destino.
 
-**RF07 — Registro único**
+**RF08 — Registro único**
 
 Cada operação deverá possuir no máximo um snapshot `REGISTRO_CLEARING`.
 
-**RF08 — Eventos**
+**RF09 — Eventos**
 
 Um registro poderá possuir múltiplos eventos.
 
-**RF09 — Append-only**
+**RF10 — Append-only**
 
 Eventos existentes não deverão ser sobrescritos.
 
-**RF10 — GSI**
+**RF11 — GSI**
 
 Deverá existir:
 
-```text id="v56f0a"
+```text
 INDICE_ID_EXTERNO
 ```
 
-com:
+utilizando:
 
-```text id="wl9frg"
-PK = ID_EXTERNO#<idExterno>
-SK = REGISTRO#<idOperacao>
+```text
+Partition Key = identificadorExterno
+Sort Key = identificadorRegistro
 ```
 
-**RF11 — Produtos**
+**RF12 — Produtos**
 
-Novos produtos não deverão exigir alteração da PK/SK.
+Novos produtos não deverão exigir alteração das chaves principais.
 
-**RF12 — Clearings**
+**RF13 — Clearings**
 
-Novas clearings não deverão exigir alteração da PK/SK.
+Novas clearings não deverão exigir alteração das chaves principais.
 
-**RF13 — Origens**
+**RF14 — Origem**
 
 O modelo deverá ser independente da origem da operação.
 
-**RF14 — Idempotência**
+**RF15 — Idempotência**
 
-O modelo deverá possuir uma estratégia de idempotência que considere reprocessamento, duplicidade e concorrência.
+O modelo deverá suportar uma estratégia de idempotência para evitar processamento duplicado.
 
-**RF15 — Terraform**
+**RF16 — Terraform**
 
 A estrutura oficial deverá ser provisionada através de Terraform.
 
@@ -1387,32 +1105,33 @@ A estrutura oficial deverá ser provisionada através de Terraform.
 
 Deverá ser possível persistir uma operação utilizando:
 
-```text id="m7zt7q"
-PK = OPERACAO#<idOperacao>
-SK = OPERACAO
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = OPERACAO
 ```
 
 **CA02**
 
 Deverá ser possível persistir o registro atual utilizando:
 
-```text id="v0azui"
-PK = OPERACAO#<idOperacao>
-SK = REGISTRO
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = REGISTRO
 ```
 
 **CA03**
 
-Uma operação não deverá possuir mais de um snapshot de registro.
+Uma operação não deverá possuir mais de um snapshot `REGISTRO_CLEARING`.
 
 **CA04**
 
 Deverá ser possível persistir múltiplos eventos utilizando:
 
-```text id="7ip8m6"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado =
+OPERACAO#<idOperacao>
 
-SK =
+chaveEntidade =
 REGISTRO#EVENTO#<timestamp>#<idEvento>
 ```
 
@@ -1422,56 +1141,58 @@ Eventos deverão permanecer append-only.
 
 **CA06**
 
-Uma Query utilizando apenas:
+Uma Query utilizando somente:
 
-```text id="s8ss7a"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado =
+OPERACAO#<idOperacao>
 ```
 
-deverá recuperar o agregado da operação.
+deverá recuperar o agregado completo.
 
 **CA07**
 
-Uma consulta utilizando:
+A combinação:
 
-```text id="3pwbh8"
-PK = OPERACAO#<idOperacao>
-SK = OPERACAO
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = OPERACAO
 ```
 
 deverá recuperar exclusivamente a operação.
 
 **CA08**
 
-Uma consulta utilizando:
+A combinação:
 
-```text id="hrb4yy"
-PK = OPERACAO#<idOperacao>
-SK = REGISTRO
+```text
+identificadorAgregado = OPERACAO#<idOperacao>
+chaveEntidade = REGISTRO
 ```
 
-deverá recuperar o snapshot atual.
+deverá recuperar exclusivamente o snapshot atual do registro.
 
 **CA09**
 
 Uma Query utilizando:
 
-```text id="4kxbx5"
-PK = OPERACAO#<idOperacao>
+```text
+identificadorAgregado =
+OPERACAO#<idOperacao>
 
-SK begins_with
+chaveEntidade begins_with
 REGISTRO#EVENTO#
 ```
 
-deverá recuperar a timeline.
+deverá recuperar a timeline do registro.
 
 **CA10**
 
-Deverá ser possível recuperar o último evento utilizando ordenação decrescente e `Limit = 1`.
+Deverá ser possível recuperar o último evento através da ordenação decrescente da Sort Key e `Limit = 1`.
 
 **CA11**
 
-Deverá ser possível localizar um registro através do `idExterno` utilizando `INDICE_ID_EXTERNO`.
+Deverá ser possível localizar um registro pelo `idExterno` através do `INDICE_ID_EXTERNO`.
 
 **CA12**
 
@@ -1479,33 +1200,39 @@ Uma operação deverá possuir exatamente uma clearing de destino.
 
 **CA13**
 
-A inclusão de nova clearing não deverá exigir alteração de PK/SK.
+Novos produtos não deverão exigir alteração da estrutura das chaves.
 
 **CA14**
 
-A inclusão de novo produto não deverá exigir alteração de PK/SK.
+Novas clearings não deverão exigir alteração da estrutura das chaves.
 
 **CA15**
 
-A POC deverá conter ao menos:
+A POC deverá validar pelo menos:
 
-```text id="qoxntj"
-Aplicação aceita
-Resgate rejeitado
-Operação de produto/origem/clearing futura
+```text
+Aplicação RDB aceita pela B3
+
+Resgate RDB rejeitado pela B3
+
+Consulta do agregado
+
+Consulta da timeline
+
+Consulta do último evento
+
+Consulta pelo identificador externo
 ```
-
-para demonstrar a flexibilidade da estrutura.
 
 **CA16**
 
-A estrutura oficial deverá ser declarada através de Terraform.
+A estrutura oficial deverá estar declarada através de Terraform.
 
 ---
 
 # Resumo final das chaves
 
-| Item | PK | SK |
+| Item | identificadorAgregado | chaveEntidade |
 |---|---|---|
 | Operação | `OPERACAO#<idOperacao>` | `OPERACAO` |
 | Registro | `OPERACAO#<idOperacao>` | `REGISTRO` |
@@ -1513,21 +1240,26 @@ A estrutura oficial deverá ser declarada através de Terraform.
 
 GSI:
 
-| Índice | PK | SK |
+| Índice | Partition Key | Sort Key |
 |---|---|---|
-| `INDICE_ID_EXTERNO` | `ID_EXTERNO#<idExterno>` | `REGISTRO#<idOperacao>` |
+| `INDICE_ID_EXTERNO` | `identificadorExterno` | `identificadorRegistro` |
 
-Regra mental do modelo:
+Regra mental final:
 
-```text id="i8ks98"
-PK
-"De qual operação estamos falando?"
+```text
+identificadorAgregado
+        │
+        └── "De qual operação?"
 
-SK
-"O que estamos olhando dentro dessa operação?"
+chaveEntidade
+        │
+        └── "O que é dentro da operação?"
 
-GSI
-"Não conheço a operação,
-mas conheço um identificador externo.
-Como encontro o registro?"
+identificadorExterno
+        │
+        └── "Qual identificação recebemos do mundo externo?"
+
+identificadorRegistro
+        │
+        └── "A qual registro/operação ela corresponde?"
 ```
