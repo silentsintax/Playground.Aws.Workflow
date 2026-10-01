@@ -2619,3 +2619,382 @@ A responsabilidade desta história termina em:
 ```
 
 O processamento posterior da operação para determinar, preparar e executar o registro na B3 ou em qualquer outra clearing pertence às próximas etapas da arquitetura.
+
+
+
+#!/bin/bash
+
+set -e
+
+TABELA="OPERACOES_CLEARING"
+
+echo "=========================================="
+echo " Criando POC DynamoDB - Multi Clearing"
+echo "=========================================="
+
+echo ""
+echo "1. Criando tabela $TABELA..."
+
+aws dynamodb create-table \
+  --table-name "$TABELA" \
+  --attribute-definitions \
+      AttributeName=chaveParticao,AttributeType=S \
+      AttributeName=chaveOrdenacao,AttributeType=S \
+      AttributeName=chaveParticaoIndiceIdExterno,AttributeType=S \
+      AttributeName=chaveOrdenacaoIndiceIdExterno,AttributeType=S \
+  --key-schema \
+      AttributeName=chaveParticao,KeyType=HASH \
+      AttributeName=chaveOrdenacao,KeyType=RANGE \
+  --global-secondary-indexes '[
+    {
+      "IndexName": "INDICE_ID_EXTERNO",
+      "KeySchema": [
+        {
+          "AttributeName": "chaveParticaoIndiceIdExterno",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "chaveOrdenacaoIndiceIdExterno",
+          "KeyType": "RANGE"
+        }
+      ],
+      "Projection": {
+        "ProjectionType": "ALL"
+      }
+    }
+  ]' \
+  --billing-mode PAY_PER_REQUEST
+
+echo ""
+echo "2. Aguardando tabela ficar disponível..."
+
+aws dynamodb wait table-exists \
+  --table-name "$TABELA"
+
+echo ""
+echo "Tabela criada com sucesso."
+
+# -------------------------------------------------------
+# IDs utilizados na POC
+# -------------------------------------------------------
+
+ID_OPERACAO="OP-000001"
+ID_REGISTRO="REG-000001"
+ID_EXTERNO="CLEARING-000001"
+
+echo ""
+echo "=========================================="
+echo " Inserindo cenário da POC"
+echo "=========================================="
+
+# -------------------------------------------------------
+# OPERAÇÃO
+# -------------------------------------------------------
+
+echo ""
+echo "3. Inserindo OPERACAO..."
+
+aws dynamodb put-item \
+  --table-name "$TABELA" \
+  --item '{
+    "chaveParticao": {
+      "S": "OPERACAO#OP-000001"
+    },
+    "chaveOrdenacao": {
+      "S": "METADADOS"
+    },
+    "tipoEntidade": {
+      "S": "OPERACAO"
+    },
+    "idOperacao": {
+      "S": "OP-000001"
+    },
+    "tipoOperacao": {
+      "S": "APLICACAO"
+    },
+    "produto": {
+      "S": "RDB"
+    },
+    "valor": {
+      "N": "15000.50"
+    },
+    "dataOperacao": {
+      "S": "2026-10-01"
+    },
+    "tipoOrigem": {
+      "S": "ARQUIVO"
+    },
+    "idOperacaoOrigem": {
+      "S": "OPERACAO-SISTEMA-987654"
+    },
+    "chaveIdempotencia": {
+      "S": "SISTEMA_ORIGEM#OPERACAO-SISTEMA-987654"
+    },
+    "dadosProduto": {
+      "M": {
+        "numeroRdb": {
+          "S": "RDB-987654"
+        },
+        "indexador": {
+          "S": "CDI"
+        },
+        "taxa": {
+          "N": "102.5"
+        },
+        "dataVencimento": {
+          "S": "2027-10-01"
+        }
+      }
+    },
+    "dataHoraCriacao": {
+      "S": "2026-10-01T10:00:00Z"
+    }
+  }'
+
+# -------------------------------------------------------
+# REGISTRO CLEARING
+# -------------------------------------------------------
+
+echo ""
+echo "4. Inserindo REGISTRO_CLEARING..."
+
+aws dynamodb put-item \
+  --table-name "$TABELA" \
+  --item '{
+    "chaveParticao": {
+      "S": "OPERACAO#OP-000001"
+    },
+    "chaveOrdenacao": {
+      "S": "REGISTRO#REG-000001"
+    },
+    "tipoEntidade": {
+      "S": "REGISTRO_CLEARING"
+    },
+    "idOperacao": {
+      "S": "OP-000001"
+    },
+    "idRegistro": {
+      "S": "REG-000001"
+    },
+    "clearing": {
+      "S": "B3"
+    },
+    "idExterno": {
+      "S": "CLEARING-000001"
+    },
+    "status": {
+      "S": "ACEITO"
+    },
+    "tentativa": {
+      "N": "1"
+    },
+    "protocoloExterno": {
+      "S": "B3-PROT-987654"
+    },
+    "chaveParticaoIndiceIdExterno": {
+      "S": "ID_EXTERNO#CLEARING-000001"
+    },
+    "chaveOrdenacaoIndiceIdExterno": {
+      "S": "REGISTRO#REG-000001"
+    },
+    "dataHoraEnvio": {
+      "S": "2026-10-01T10:01:00Z"
+    },
+    "dataHoraRetorno": {
+      "S": "2026-10-01T10:05:00Z"
+    },
+    "dataHoraAtualizacao": {
+      "S": "2026-10-01T10:05:00Z"
+    }
+  }'
+
+# -------------------------------------------------------
+# EVENTO 1
+# -------------------------------------------------------
+
+echo ""
+echo "5. Inserindo evento REGISTRO_CRIADO..."
+
+aws dynamodb put-item \
+  --table-name "$TABELA" \
+  --item '{
+    "chaveParticao": {
+      "S": "OPERACAO#OP-000001"
+    },
+    "chaveOrdenacao": {
+      "S": "REGISTRO#REG-000001#EVENTO#20261001T100000.000Z#EVT-001"
+    },
+    "tipoEntidade": {
+      "S": "EVENTO_REGISTRO"
+    },
+    "idRegistro": {
+      "S": "REG-000001"
+    },
+    "tipoEvento": {
+      "S": "REGISTRO_CRIADO"
+    },
+    "statusAtual": {
+      "S": "PENDENTE"
+    },
+    "dataHoraEvento": {
+      "S": "2026-10-01T10:00:00Z"
+    }
+  }'
+
+# -------------------------------------------------------
+# EVENTO 2
+# -------------------------------------------------------
+
+echo ""
+echo "6. Inserindo evento ENVIO_REALIZADO..."
+
+aws dynamodb put-item \
+  --table-name "$TABELA" \
+  --item '{
+    "chaveParticao": {
+      "S": "OPERACAO#OP-000001"
+    },
+    "chaveOrdenacao": {
+      "S": "REGISTRO#REG-000001#EVENTO#20261001T100100.000Z#EVT-002"
+    },
+    "tipoEntidade": {
+      "S": "EVENTO_REGISTRO"
+    },
+    "idRegistro": {
+      "S": "REG-000001"
+    },
+    "tipoEvento": {
+      "S": "ENVIO_REALIZADO"
+    },
+    "statusAnterior": {
+      "S": "PENDENTE"
+    },
+    "statusAtual": {
+      "S": "ENVIADO"
+    },
+    "dataHoraEvento": {
+      "S": "2026-10-01T10:01:00Z"
+    }
+  }'
+
+# -------------------------------------------------------
+# EVENTO 3
+# -------------------------------------------------------
+
+echo ""
+echo "7. Inserindo evento RETORNO_RECEBIDO..."
+
+aws dynamodb put-item \
+  --table-name "$TABELA" \
+  --item '{
+    "chaveParticao": {
+      "S": "OPERACAO#OP-000001"
+    },
+    "chaveOrdenacao": {
+      "S": "REGISTRO#REG-000001#EVENTO#20261001T100500.000Z#EVT-003"
+    },
+    "tipoEntidade": {
+      "S": "EVENTO_REGISTRO"
+    },
+    "idRegistro": {
+      "S": "REG-000001"
+    },
+    "tipoEvento": {
+      "S": "RETORNO_RECEBIDO"
+    },
+    "origemEvento": {
+      "S": "PISMO"
+    },
+    "idEventoExterno": {
+      "S": "PISMO-EVT-789"
+    },
+    "dataHoraEvento": {
+      "S": "2026-10-01T10:05:00Z"
+    }
+  }'
+
+# -------------------------------------------------------
+# EVENTO 4
+# -------------------------------------------------------
+
+echo ""
+echo "8. Inserindo evento STATUS_ALTERADO..."
+
+aws dynamodb put-item \
+  --table-name "$TABELA" \
+  --item '{
+    "chaveParticao": {
+      "S": "OPERACAO#OP-000001"
+    },
+    "chaveOrdenacao": {
+      "S": "REGISTRO#REG-000001#EVENTO#20261001T100501.000Z#EVT-004"
+    },
+    "tipoEntidade": {
+      "S": "EVENTO_REGISTRO"
+    },
+    "idRegistro": {
+      "S": "REG-000001"
+    },
+    "tipoEvento": {
+      "S": "STATUS_ALTERADO"
+    },
+    "statusAnterior": {
+      "S": "ENVIADO"
+    },
+    "statusAtual": {
+      "S": "ACEITO"
+    },
+    "protocoloExterno": {
+      "S": "B3-PROT-987654"
+    },
+    "dataHoraEvento": {
+      "S": "2026-10-01T10:05:01Z"
+    }
+  }'
+
+echo ""
+echo "=========================================="
+echo " POC criada com sucesso!"
+echo "=========================================="
+
+echo ""
+echo "Estrutura:"
+echo ""
+echo "OPERACAO#OP-000001"
+echo " |"
+echo " +-- METADADOS"
+echo " |"
+echo " +-- REGISTRO#REG-000001"
+echo " |"
+echo " +-- EVENTO REGISTRO_CRIADO"
+echo " +-- EVENTO ENVIO_REALIZADO"
+echo " +-- EVENTO RETORNO_RECEBIDO"
+echo " +-- EVENTO STATUS_ALTERADO"
+echo ""
+
+echo "Consultando operação completa..."
+
+aws dynamodb query \
+  --table-name "$TABELA" \
+  --key-condition-expression "chaveParticao = :pk" \
+  --expression-attribute-values '{
+    ":pk": {
+      "S": "OPERACAO#OP-000001"
+    }
+  }'
+
+echo ""
+echo "Consultando pelo ID externo através do GSI..."
+
+aws dynamodb query \
+  --table-name "$TABELA" \
+  --index-name "INDICE_ID_EXTERNO" \
+  --key-condition-expression "chaveParticaoIndiceIdExterno = :pk" \
+  --expression-attribute-values '{
+    ":pk": {
+      "S": "ID_EXTERNO#CLEARING-000001"
+    }
+  }'
+
+echo ""
+echo "Fim da POC."
