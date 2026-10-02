@@ -1,15 +1,15 @@
-# Histórias — Plataforma Multi Clearing
+# Histórias modificadas — modelo DynamoDB com 3 tabelas
 
-Arquivos separados por história:
+Incluídas: H02, H03, H04, H05, H08, H09 e H11.
 
-- H02 — Ingestão do arquivo: EventBridge → Batch → Adapter CSV → DynamoDB
-- H04 — DynamoDB Streams → EventBridge Pipes → SQS
-- H05 — Registration Worker e roteamento
-- H06 — Integração/Adapter B3
-- H07 — Retorno Pismo: SNS cross-account → SQS
-- H08 — Processamento do retorno
-- H09 — Observabilidade
-- H10 — Segurança e permissões
-- H11 — Teste E2E
+A H03 contém também:
+- configuração manual das três tabelas no AWS Console;
+- PK/SK/GSI;
+- massa de dados;
+- JSONs de POC;
+- consultas;
+- cenários de validação;
+- volumetria;
+- atomicidade e Streams.
 
-H01 (S3) e H03 (estrutura DynamoDB) já haviam sido elaboradas anteriormente e não foram recriadas neste pacote.
+H06, H07 e H10 não sofreram alteração material por causa da mudança de single-table para três tabelas.

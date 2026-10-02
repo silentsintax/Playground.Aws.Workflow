@@ -1,45 +1,19 @@
-# H08 — Processar retorno das operações B3
+# H08 — Processar retorno B3 recebido através da Pismo
 
 ## Objetivo
-Consumir retornos da SQS, correlacioná-los às operações e atualizar o estado atual e o histórico.
+Consumir retorno, correlacionar por `idExterno`, atualizar estado e histórico.
 
 ## Descrição detalhada
 ```text
-SQS RETORNO → Return Worker → idExterno → INDICE_ID_EXTERNO
-            → REGISTRO_CLEARING → atualizar snapshot + adicionar EVENTO_REGISTRO
+SQS RETORNO → Return Worker → INDICE_ID_EXTERNO
+            → idOperacao
+            → UPDATE REGISTROS_CLEARING
+            + PUT EVENTOS_REGISTRO
 ```
-
-Consulta:
-```text
-identificadorExterno = ID_EXTERNO#<idExterno>
-```
-
-O item `REGISTRO` deverá ser atualizado e um evento append-only criado:
-
-```text
-REGISTRO#EVENTO#<timestamp>#<idEvento>
-```
-
-Quando necessário, utilizar transação DynamoDB para atualizar snapshot e inserir evento atomicamente.
-
-O retorno deverá ser idempotente. Entrega duplicada não pode produzir transições funcionais duplicadas.
+Usar `TransactWriteItems` quando aplicável e garantir idempotência do retorno.
 
 ## Requisitos
-- RF01 — Consumir SQS de retorno.
-- RF02 — Extrair id externo.
-- RF03 — Consultar `INDICE_ID_EXTERNO`.
-- RF04 — Identificar operação.
-- RF05 — Atualizar `REGISTRO_CLEARING`.
-- RF06 — Criar `EVENTO_REGISTRO`.
-- RF07 — Histórico append-only.
-- RF08 — Idempotência do retorno.
-- RF09 — Retorno sem correlação tratado.
+Consumir SQS; extrair id externo; consultar GSI; atualizar registro; criar evento append-only; transação; idempotência; tratar retorno sem correlação.
 
 ## Critérios de aceite
-- CA01 — Retorno conhecido localiza operação.
-- CA02 — Status atual atualizado.
-- CA03 — Alteração gera histórico.
-- CA04 — Evento existente não é sobrescrito.
-- CA05 — Notificação duplicada não duplica transição.
-- CA06 — Retorno sem correlação é investigável.
-- CA07 — Falha segue retry/DLQ.
+Retorno conhecido localiza operação; estado e histórico atualizados atomicamente; duplicidade não duplica transição; falhas seguem retry/DLQ.

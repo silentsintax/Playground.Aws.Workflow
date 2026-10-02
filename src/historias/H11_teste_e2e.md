@@ -1,42 +1,18 @@
 # H11 — Validar fluxo integrado RDB B3 ponta a ponta
 
 ## Objetivo
-Validar o fluxo desde a entrada do arquivo RDB até o retorno B3 recebido pela Pismo.
+Validar o fluxo completo com três tabelas.
 
 ## Descrição detalhada
 ```text
-CSV → S3 → EventBridge → Batch → Adapter CSV → DynamoDB
-    → Streams → Pipes → SQS Registro → Registration Worker
-    → Adapter B3 → B3 → Pismo → SNS → SQS Retorno
-    → Return Worker → DynamoDB
+CSV → S3 → EventBridge → Batch → Adapter
+    → OPERACOES + REGISTROS_CLEARING
+    → Stream OPERACOES → Pipes → SQS
+    → Registration Worker → B3 → Pismo → SNS → SQS Retorno
+    → Return Worker → REGISTROS_CLEARING + EVENTOS_REGISTRO
 ```
 
-Cenários mínimos:
-- operação aceita;
-- operação rejeitada;
-- linha inválida;
-- mensagem duplicada;
-- falha transitória;
-- retorno duplicado;
-- retorno sem correlação;
-- DLQ.
-
-Ao final, deverá ser possível consultar `OPERACAO`, `REGISTRO` atual e `EVENTOS` por:
-
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-```
-
-## Requisitos
-Testes em ambiente controlado/homologação, com evidências dos cenários. AWS Console pode ser usado na POC para inspeção, mas sucesso em escala não deverá depender de consultas manuais.
+Validar operação aceita/rejeitada, linha inválida, duplicidades, falha transitória, resultado indeterminado, retorno duplicado/sem correlação e DLQ. Validar consistência entre status atual e histórico.
 
 ## Critérios de aceite
-- CA01 — Arquivo válido cria operações esperadas.
-- CA02 — Operação chega à integração B3.
-- CA03 — Retorno é correlacionado.
-- CA04 — `REGISTRO` reflete estado final.
-- CA05 — Histórico reflete transições.
-- CA06 — Duplicidade de mensagem não gera duplicidade financeira.
-- CA07 — Falhas previstas têm comportamento conhecido.
-- CA08 — DLQs e alarmes validados.
-- CA09 — Caminho da operação reconstruível por correlação.
+Operação e registro inicial criados; Stream inicia processamento; B3 recebe; retorno correlaciona por `idExterno`; estado final e histórico corretos; duplicidades não geram duplicidade financeira; retry/DLQ e rastreabilidade por `idOperacao` validados.
