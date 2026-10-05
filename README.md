@@ -2168,3 +2168,1366 @@ O DynamoDB permanecerá flexível fisicamente, enquanto o domínio permanecerá 
 
 
 ```
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>H02 - Implementar ingestão de operações via AWS Batch</title>
+<style>
+    body {
+        font-family: Arial, Helvetica, sans-serif;
+        line-height: 1.6;
+        color: #24292f;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 40px;
+    }
+    h1 {
+        color: #1f4e79;
+        border-bottom: 2px solid #d0d7de;
+        padding-bottom: 8px;
+        margin-top: 40px;
+    }
+    h2 {
+        color: #2f5f8f;
+        margin-top: 30px;
+    }
+    h3 {
+        color: #444;
+        margin-top: 24px;
+    }
+    pre {
+        background-color: #f6f8fa;
+        border: 1px solid #d0d7de;
+        border-radius: 6px;
+        padding: 16px;
+        overflow-x: auto;
+    }
+    code {
+        font-family: Consolas, Monaco, monospace;
+    }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 20px 0;
+    }
+    th, td {
+        border: 1px solid #d0d7de;
+        padding: 10px;
+        text-align: left;
+    }
+    th {
+        background-color: #f6f8fa;
+    }
+    blockquote {
+        border-left: 4px solid #1f4e79;
+        padding: 10px 20px;
+        margin: 20px 0;
+        background-color: #f6f8fa;
+    }
+    .important {
+        background-color: #fff8c5;
+        border-left: 4px solid #d4a72c;
+        padding: 12px;
+        margin: 20px 0;
+    }
+    .success {
+        background-color: #dafbe1;
+        border-left: 4px solid #2da44e;
+        padding: 12px;
+        margin: 20px 0;
+    }
+</style>
+</head>
+<body>
+<h1>Título</h1>
+<p>
+    Implementar ingestão de operações via AWS Batch com adaptação
+    para o modelo canônico.
+</p>
+<h1>Objetivo</h1>
+<p>
+    Implementar o fluxo responsável por receber o evento de disponibilização
+    de um arquivo de operações no S3, iniciar um processamento AWS Batch,
+    realizar a leitura do arquivo de forma eficiente, converter cada registro
+    externo para o modelo canônico da plataforma de clearing e persistir
+    as operações no DynamoDB.
+</p>
+<p>
+    O fluxo deverá suportar inicialmente arquivos CSV contendo operações
+    de RDB, considerando volumes estimados entre
+    <strong>20 e 30 milhões de registros por arquivo</strong>.
+</p>
+<p>
+    A implementação deverá ser preparada para evolução futura de produtos
+    e origens sem acoplar o domínio da plataforma ao formato do arquivo.
+</p>
+<pre>
+Arquivo CSV
+    │
+    ▼
+S3
+    │
+    ▼
+EventBridge
+    │
+    ▼
+AWS Batch
+    │
+    ▼
+Leitor CSV
+    │
+    ▼
+Adapter da origem
+    │
+    ▼
+Modelo canônico
+    │
+    ▼
+Validação
+    │
+    ▼
+Persistência
+    │
+    ├── OPERACOES
+    │
+    └── REGISTROS_CLEARING
+</pre>
+<h1>1. Responsabilidade do AWS Batch</h1>
+<p>
+    O AWS Batch será responsável exclusivamente pela etapa de
+    <strong>ingestão</strong>.
+</p>
+<p>Suas responsabilidades serão:</p>
+<ol>
+    <li>receber a identificação do arquivo;</li>
+    <li>abrir o arquivo no S3;</li>
+    <li>realizar leitura streaming;</li>
+    <li>interpretar cada linha;</li>
+    <li>converter o registro externo para o modelo canônico;</li>
+    <li>validar o modelo produzido;</li>
+    <li>gerar identificadores técnicos;</li>
+    <li>aplicar estratégia de idempotência;</li>
+    <li>persistir a operação;</li>
+    <li>criar seu registro inicial de clearing;</li>
+    <li>registrar métricas e erros de processamento.</li>
+</ol>
+<div class="important">
+    <strong>Importante:</strong>
+    O Batch não deverá registrar diretamente a operação na B3.
+</div>
+<pre>
+Batch
+  │
+  ▼
+OPERACOES
+  │
+  ▼
+DynamoDB Stream
+  │
+  ▼
+EventBridge Pipes
+  │
+  ▼
+SQS
+  │
+  ▼
+Registration Worker
+  │
+  ▼
+B3
+</pre>
+<p>
+    Essa separação impede que problemas da B3 reduzam a capacidade
+    de ingestão do arquivo.
+</p>
+<h1>2. Princípio arquitetural</h1>
+<p>
+    O arquivo CSV é um <strong>contrato externo</strong>.
+</p>
+<p>
+    O modelo DynamoDB é um <strong>contrato interno da plataforma</strong>.
+</p>
+<p>
+    Portanto, não deverão ser equivalentes.
+</p>
+<pre>
+CSV
+CD_PROD
+TP_MOV
+VL_MOV
+DT_MOV
+CD_CLEARING
+COD_RDB
+DT_VCTO
+        │
+        ▼
+     CsvAdapter
+        │
+        ▼
+Modelo canônico
+produto
+tipoOperacao
+clearingDestino
+dadosOperacao
+...
+</pre>
+<blockquote>
+    A aplicação não deverá possuir código de domínio dependente
+    de nomes de colunas do CSV.
+</blockquote>
+<h1>3. Arquitetura interna do Batch</h1>
+<pre>
+Batch Job
+│
+├── Orquestração
+│   └── ProcessarArquivoUseCase
+│
+├── Entrada
+│   ├── S3FileReader
+│   ├── CsvParser
+│   └── CsvAdapter
+│
+├── Domínio
+│   ├── Operacao
+│   ├── RegistroClearing
+│   ├── Validadores
+│   └── Regras
+│
+├── Persistência
+│   ├── OperacaoRepository
+│   └── RegistroClearingRepository
+│
+└── Infraestrutura
+    ├── S3
+    ├── DynamoDB
+    ├── Logs
+    └── Métricas
+</pre>
+<p>O fluxo interno deverá ser aproximadamente:</p>
+<pre>
+Stream S3
+    │
+    ▼
+Parser
+    │
+    ▼
+DTO externo
+    │
+    ▼
+Adapter
+    │
+    ▼
+Modelo canônico
+    │
+    ▼
+Validator
+    │
+    ▼
+Persistence
+</pre>
+<h1>4. Separação Parser × Adapter</h1>
+<p>
+    Essas duas responsabilidades não deverão ser misturadas.
+</p>
+<h2>Parser</h2>
+<p>
+    Responsável apenas por interpretar fisicamente o arquivo.
+</p>
+<p>Entrada:</p>
+<pre>
+RDB;A;15000.50;2026-10-05;B3;RDB001
+</pre>
+<p>Saída conceitual:</p>
+<pre><code>ArquivoOperacaoDto</code></pre>
+<p>Exemplo:</p>
+<pre><code>public sealed class ArquivoOperacaoDto
+{
+    public string CodigoProduto { get; init; }
+    public string TipoMovimento { get; init; }
+    public decimal ValorMovimento { get; init; }
+    public DateOnly DataMovimento { get; init; }
+    public string CodigoClearing { get; init; }
+    public string CodigoRdb { get; init; }
+}</code></pre>
+<p>
+    Esse DTO representa <strong>o contrato do arquivo</strong>,
+    não o domínio.
+</p>
+<h1>5. Adapter</h1>
+<p>O Adapter será responsável por traduzir:</p>
+<pre>
+Contrato externo
+       ↓
+Modelo canônico
+</pre>
+<p>Interface sugerida:</p>
+<pre><code>public interface IOperacaoAdapter&lt;in TEntrada&gt;
+{
+    Operacao Adaptar(
+        TEntrada entrada,
+        ContextoIngestao contexto);
+}</code></pre>
+<p>Implementação inicial:</p>
+<pre><code>public sealed class CsvRdbOperacaoAdapter
+    : IOperacaoAdapter&lt;ArquivoOperacaoDto&gt;
+{
+    public Operacao Adaptar(
+        ArquivoOperacaoDto entrada,
+        ContextoIngestao contexto)
+    {
+        // tradução para o domínio
+    }
+}</code></pre>
+<p>O Adapter deverá conhecer:</p>
+<pre>
+CSV → modelo canônico
+</pre>
+<p>Mas o domínio não deverá conhecer:</p>
+<pre>
+modelo canônico → CSV
+</pre>
+<h1>6. Modelo canônico produzido</h1>
+<p>
+    O resultado do Adapter deverá seguir o contrato definido
+    na história do DynamoDB.
+</p>
+<pre><code>{
+  "idOperacao": "550e8400-e29b-41d4-a716-446655440001",
+  "produto": "RDB",
+  "tipoOperacao": "APLICACAO",
+  "clearingDestino": "B3",
+  "chaveIdempotencia": "ARQUIVO#20261005#987654",
+  "versaoModelo": 1,
+  "origem": {
+    "tipo": "ARQUIVO",
+    "identificador": "ARQ-987654"
+  },
+  "dataHoraInclusao": "2026-10-05T10:00:00.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:00:00.000Z",
+  "dadosOperacao": {
+    "valor": 15000.50,
+    "dataOperacao": "2026-10-05",
+    "codigoRdb": "RDB001",
+    "dataVencimento": "2028-10-05",
+    "taxa": 0.125
+  }
+}</code></pre>
+<h1>7. Evolução para novos produtos</h1>
+<p>
+    A inclusão de CDB não deverá exigir alteração no fluxo principal do Batch.
+</p>
+<pre>
+                  Registro CSV
+                       │
+                       ▼
+                    Parser
+                       │
+                       ▼
+                 Identifica produto
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+      CsvRdbAdapter        CsvCdbAdapter
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+                Modelo canônico
+</pre>
+<p>
+    A seleção poderá ser realizada através de uma Factory/Resolver.
+</p>
+<pre><code>public interface IOperacaoAdapterResolver
+{
+    IOperacaoAdapter&lt;ArquivoOperacaoDto&gt; Obter(
+        string produto);
+}</code></pre>
+<pre><code>var adapter =
+    adapterResolver.Obter(dto.CodigoProduto);
+var operacao =
+    adapter.Adaptar(dto, contexto);</code></pre>
+<p>Evitar código desse tipo espalhado pela aplicação:</p>
+<pre><code>if (produto == "RDB")
+{
+    ...
+}
+else if (produto == "CDB")
+{
+    ...
+}
+else if (produto == "LCI")
+{
+    ...
+}</code></pre>
+<h1>8. Evolução para Kafka</h1>
+<pre>
+CSV
+ │
+ ▼
+CsvParser
+ │
+ ▼
+CsvAdapter
+ │
+ └──────────────┐
+                │
+                ▼
+         MODELO CANÔNICO
+                ▲
+                │
+KafkaAdapter ───┘
+ ▲
+ │
+Kafka
+</pre>
+<p>
+    O domínio e os repositories deverão receber o mesmo objeto
+    <code>Operacao</code>, independentemente da origem.
+</p>
+<pre>
+CsvAdapter
+KafkaAdapter
+ApiAdapter
+</pre>
+<p>Esses adapters poderão existir sem alterar:</p>
+<pre>
+OperacaoRepository
+RegistroClearingRepository
+Registration Worker
+Clearing Router
+Adapter B3
+</pre>
+<h1>9. Validação</h1>
+<p>
+    A validação deverá ocorrer <strong>depois do Adapter</strong>.
+</p>
+<pre>
+DTO externo
+    │
+    ▼
+Adapter
+    │
+    ▼
+Operacao canônica
+    │
+    ▼
+Validator
+</pre>
+<p>
+    Isso é importante porque a validação deve ocorrer sobre o contrato
+    da plataforma, e não apenas sobre o contrato externo.
+</p>
+<pre><code>public interface IOperacaoValidator
+{
+    ResultadoValidacao Validar(Operacao operacao);
+}</code></pre>
+<p>Poderão existir:</p>
+<pre>
+RDB + versão 1
+      ↓
+RdbOperacaoValidatorV1
+CDB + versão 1
+      ↓
+CdbOperacaoValidatorV1
+</pre>
+<h1>10. Tipos de validação</h1>
+<h2>Validação estrutural</h2>
+<pre>
+campo obrigatório ausente
+data inválida
+decimal inválido
+linha corrompida
+quantidade inesperada de colunas
+</pre>
+<h2>Validação canônica</h2>
+<pre>
+produto inexistente
+tipoOperacao inválido
+clearing não suportada
+versaoModelo não suportada
+</pre>
+<h2>Validação de produto</h2>
+<p>Exemplo RDB:</p>
+<pre>
+valor > 0
+codigoRdb obrigatório
+dataOperacao válida
+vencimento válido
+</pre>
+<h1>11. Tratamento de linhas inválidas</h1>
+<p>
+    Uma linha inválida <strong>não deverá interromper automaticamente
+    o arquivo inteiro</strong>.
+</p>
+<pre>
+20.000.000 linhas
+19.999.970 válidas
+30 inválidas
+</pre>
+<p>
+    As 30 inválidas deverão ser registradas para análise.
+</p>
+<p>O processamento deverá produzir métricas como:</p>
+<pre>
+linhasRecebidas
+linhasProcessadas
+linhasPersistidas
+linhasInvalidas
+linhasDuplicadas
+linhasErroTecnico
+</pre>
+<p>
+    A política definitiva para rejeição do arquivo inteiro deverá
+    ser parametrizável ou definida com negócio.
+</p>
+<pre>
+erro estrutural do arquivo
+        ↓
+interrompe job
+erro em uma operação
+        ↓
+registra rejeição
+        ↓
+continua processamento
+</pre>
+<h1>12. Leitura do arquivo</h1>
+<p>
+    Considerando arquivos com até aproximadamente 30 milhões de linhas,
+    o arquivo <strong>não deverá ser carregado integralmente em memória</strong>.
+</p>
+<p>Não fazer:</p>
+<pre><code>var conteudo =
+    await File.ReadAllTextAsync(...);</code></pre>
+<p>Nem:</p>
+<pre><code>var linhas =
+    await File.ReadAllLinesAsync(...);</code></pre>
+<p>O processamento deverá ser streaming:</p>
+<pre>
+S3 Object
+    │
+    ▼
+Stream
+    │
+    ▼
+linha
+linha
+linha
+linha
+...
+</pre>
+<p>Exemplo conceitual:</p>
+<pre><code>await using var stream =
+    await s3Reader.OpenReadAsync(bucket, key);
+using var reader = new StreamReader(stream);
+while (await reader.ReadLineAsync() is { } linha)
+{
+    await processador.ProcessarAsync(linha);
+}</code></pre>
+<h1>13. Uso de memória</h1>
+<pre>
+arquivo de 20 GB
+não significa
+20 GB em memória
+</pre>
+<p>
+    A memória deverá depender principalmente do tamanho
+    do buffer/lote.
+</p>
+<pre>
+Arquivo
+  │
+  ▼
+Streaming
+  │
+  ▼
+Buffer pequeno
+  │
+  ▼
+Persistência
+</pre>
+<h1>14. Processamento em lotes</h1>
+<p>
+    Embora a leitura seja linha a linha, a persistência não precisa
+    necessariamente ocorrer individualmente.
+</p>
+<pre>
+Streaming
+   │
+   ├── operação 1
+   ├── operação 2
+   ├── ...
+   └── operação N
+          │
+          ▼
+       Buffer
+          │
+          ▼
+     Persistência
+</pre>
+<p>
+    O tamanho deverá ser configurável e medido através
+    de testes de carga.
+</p>
+<h1>15. Persistência</h1>
+<p>Para cada operação válida deverão ser criados:</p>
+<pre>
+OPERACOES
++
+REGISTROS_CLEARING
+</pre>
+<p>Estado inicial sugerido:</p>
+<pre>
+PENDENTE
+</pre>
+<pre>
+OP-001
+OPERACOES
+idOperacao = OP-001
+REGISTROS_CLEARING
+idOperacao = OP-001
+status = PENDENTE
+</pre>
+<h1>16. Consistência entre as duas tabelas</h1>
+<p>Não deverá ocorrer:</p>
+<pre>
+OPERACOES
+OP-001 existe
+REGISTROS_CLEARING
+OP-001 não existe
+</pre>
+<p>
+    Para a criação inicial, avaliar/utilizar
+    <code>TransactWriteItems</code>.
+</p>
+<pre>
+TransactWriteItems
+       │
+       ├── PUT OPERACOES
+       │
+       └── PUT REGISTROS_CLEARING
+</pre>
+<p>Resultado:</p>
+<pre>
+ambos persistidos
+OU
+nenhum persistido
+</pre>
+<h1>17. Idempotência</h1>
+<p>
+    O processamento deverá assumir que um arquivo ou uma operação
+    pode ser recebido novamente.
+</p>
+<pre>
+EventBridge entrega novamente evento
+Batch reinicia
+arquivo é reenviado
+linha é processada novamente
+</pre>
+<p>
+    Isso não deverá resultar em uma nova operação financeira.
+</p>
+<p>A operação deverá possuir:</p>
+<pre>
+chaveIdempotencia
+</pre>
+<p>Exemplo:</p>
+<pre>
+ARQUIVO#20261005#987654
+</pre>
+<p>
+    A estratégia definitiva deverá ser implementada de forma
+    segura para concorrência.
+</p>
+<div class="important">
+    Não depender exclusivamente de uma consulta ao GSI seguida
+    de PutItem, pois dois processos concorrentes podem não encontrar
+    o registro e tentar inserir simultaneamente.
+</div>
+<p>
+    Deverá ser considerada escrita condicional e/ou mecanismo
+    dedicado de controle de idempotência.
+</p>
+<h1>18. Identificador da operação</h1>
+<p>
+    <code>idOperacao</code> deverá ser um identificador interno
+    da plataforma.
+</p>
+<p>Sugestão:</p>
+<pre>
+UUID/GUID
+</pre>
+<p>Exemplo:</p>
+<pre>
+550e8400-e29b-41d4-a716-446655440001
+</pre>
+<p>
+    O identificador recebido da origem deverá ser mantido separadamente.
+</p>
+<pre><code>{
+    "origem": {
+        "tipo": "ARQUIVO",
+        "identificador": "ARQ-987654"
+    }
+}</code></pre>
+<h1>19. Contexto do arquivo</h1>
+<p>
+    O processamento deverá manter informações suficientes para rastrear
+    de qual arquivo uma operação foi originada.
+</p>
+<pre>
+bucket
+objectKey
+ETag/versionId, quando aplicável
+batchJobId
+dataHoraInicio
+</pre>
+<p>
+    Essas informações poderão ser utilizadas em logs, métricas
+    e na geração da chave de idempotência.
+</p>
+<h1>20. Inicialização do Batch</h1>
+<p>
+    O EventBridge deverá iniciar o AWS Batch ao detectar o evento
+    esperado relacionado ao arquivo.
+</p>
+<pre>
+S3
+ │
+ │ Object Created
+ ▼
+EventBridge
+ │
+ ▼
+AWS Batch SubmitJob
+</pre>
+<p>O job deverá receber parâmetros mínimos, por exemplo:</p>
+<pre><code>{
+    "bucket": "bucket-operacoes",
+    "objectKey": "entrada/2026/10/05/operacoes.csv"
+}</code></pre>
+<p>
+    Evitar transportar conteúdo do arquivo no evento.
+</p>
+<h1>21. Infraestrutura AWS Batch</h1>
+<p>
+    A infraestrutura deverá ser criada via Terraform e contemplar,
+    conforme os padrões da empresa:
+</p>
+<pre>
+AWS Batch
+├── Compute Environment
+├── Job Queue
+├── Job Definition
+├── Container Image
+├── IAM Role
+├── CloudWatch Logs
+└── configurações de retry
+</pre>
+<p>
+    A imagem da aplicação .NET deverá ser publicada no repositório
+    de imagens adotado pela empresa, tipicamente ECR.
+</p>
+<pre>
+Código .NET
+    │
+    ▼
+Docker Build
+    │
+    ▼
+Container Image
+    │
+    ▼
+ECR
+    │
+    ▼
+Batch Job Definition
+</pre>
+<h1>22. Permissões mínimas</h1>
+<p>
+    O Job deverá possuir somente as permissões necessárias.
+</p>
+<pre>
+S3
+→ GetObject
+DynamoDB OPERACOES
+→ PutItem / TransactWriteItems
+→ ações adicionais estritamente necessárias
+DynamoDB REGISTROS_CLEARING
+→ PutItem / TransactWriteItems
+CloudWatch
+→ logs/métricas conforme padrão corporativo
+</pre>
+<p>Não utilizar permissões genéricas como:</p>
+<pre>
+s3:*
+dynamodb:*
+Resource: *
+</pre>
+<p>
+    sem necessidade justificada.
+</p>
+<h1>23. Retry do Batch</h1>
+<p>
+    Retry do AWS Batch deverá ser utilizado principalmente
+    para falhas técnicas do job.
+</p>
+<pre>
+falha transitória AWS
+problema de infraestrutura
+container encerrado inesperadamente
+</pre>
+<blockquote>
+    Retry do job não substitui idempotência.
+</blockquote>
+<p>
+    Se o job processou 10 milhões de linhas e falhou,
+    sua nova execução não poderá gerar duplicidade nas operações
+    já persistidas.
+</p>
+<h1>24. Estratégia de retomada</h1>
+<h2>Alternativa A — reprocessar desde o início</h2>
+<pre>
+falhou na linha 15M
+        ↓
+novo job
+        ↓
+começa na linha 1
+        ↓
+idempotência ignora já processadas
+</pre>
+<h3>Prós</h3>
+<ul>
+    <li>implementação mais simples;</li>
+    <li>menor quantidade de estado operacional;</li>
+    <li>menor complexidade de recuperação.</li>
+</ul>
+<h3>Contras</h3>
+<ul>
+    <li>releitura de grande volume;</li>
+    <li>aumento de custo;</li>
+    <li>reexecução de trabalho já realizado.</li>
+</ul>
+<h2>Alternativa B — checkpoint</h2>
+<pre>
+arquivo X
+último bloco processado = Y
+</pre>
+<p>Novo job:</p>
+<pre>
+retoma de Y
+</pre>
+<h3>Prós</h3>
+<ul>
+    <li>menos reprocessamento;</li>
+    <li>recuperação potencialmente mais rápida.</li>
+</ul>
+<h3>Contras</h3>
+<ul>
+    <li>maior complexidade;</li>
+    <li>gerenciamento de checkpoint;</li>
+    <li>cuidado adicional com consistência;</li>
+    <li>risco de introduzir erros na fronteira de retomada.</li>
+</ul>
+<h2>Recomendação para POC</h2>
+<pre>
+Alternativa A
++
+idempotência robusta
+</pre>
+<p>
+    Adicionar checkpoint somente se os testes demonstrarem necessidade.
+</p>
+<h1>25. Paralelismo</h1>
+<p>
+    Não assumir inicialmente que um arquivo processado por uma única
+    thread será suficiente para a volumetria final.
+</p>
+<p>
+    Também não implementar paralelismo agressivo sem medição.
+</p>
+<p>A POC deverá medir:</p>
+<pre>
+linhas/segundo
+operações/segundo
+tempo total
+CPU
+memória
+consumo DynamoDB
+throttling
+erros
+</pre>
+<h1>26. Backpressure</h1>
+<p>
+    O Batch não deverá produzir operações em velocidade superior
+    à capacidade segura de persistência.
+</p>
+<pre>
+Leitura rápida
+    │
+    ▼
+Buffer limitado
+    │
+    ▼
+Workers limitados
+    │
+    ▼
+DynamoDB
+</pre>
+<p>Evitar:</p>
+<pre>
+30 milhões de Tasks simultâneas
+</pre>
+<p>
+    A concorrência deverá ser configurável.
+</p>
+<h1>27. Observabilidade</h1>
+<p>
+    Cada execução deverá gerar logs estruturados.
+</p>
+<pre><code>{
+  "evento": "PROCESSAMENTO_ARQUIVO",
+  "batchJobId": "...",
+  "arquivo": "operacoes.csv",
+  "linhasProcessadas": 1250000,
+  "linhasPersistidas": 1249980,
+  "linhasInvalidas": 15,
+  "linhasDuplicadas": 5
+}</code></pre>
+<div class="important">
+    Não gerar um log INFO por linha em produção.
+    Com 30 milhões de linhas isso poderia produzir
+    30 milhões de logs desnecessários.
+</div>
+<h1>28. Métricas mínimas</h1>
+<pre>
+arquivosRecebidos
+linhasRecebidas
+linhasProcessadas
+linhasPersistidas
+linhasInvalidas
+linhasDuplicadas
+linhasErroTecnico
+tempoProcessamento
+linhasPorSegundo
+operacoesRdb
+operacoesCdb
+operacoesPorClearing
+</pre>
+<h1>29. Estrutura sugerida da solução .NET</h1>
+<pre>
+src/
+│
+├── Clearing.Ingestion.Batch
+│   ├── Program.cs
+│   └── Workers/
+│
+├── Clearing.Application
+│   ├── UseCases/
+│   │   └── ProcessarArquivo/
+│   │
+│   ├── Adapters/
+│   │   ├── IOperacaoAdapter.cs
+│   │   ├── CsvRdbOperacaoAdapter.cs
+│   │   └── CsvCdbOperacaoAdapter.cs
+│   │
+│   └── Validators/
+│
+├── Clearing.Domain
+│   ├── Operacao.cs
+│   ├── RegistroClearing.cs
+│   └── ValueObjects/
+│
+└── Clearing.Infrastructure
+    ├── S3/
+    ├── DynamoDb/
+    └── Observability/
+</pre>
+<p>
+    O nome real deverá seguir o padrão corporativo.
+</p>
+<h1>30. Testes unitários</h1>
+<p>
+    Os Adapters deverão possuir testes unitários independentes da AWS.
+</p>
+<pre>
+Given
+linha RDB válida
+When
+CsvRdbAdapter.Adaptar()
+Then
+produto = RDB
+tipoOperacao = APLICACAO
+clearingDestino = B3
+dadosOperacao.valor = 15000.50
+</pre>
+<p>Casos mínimos:</p>
+<ul>
+    <li>RDB aplicação;</li>
+    <li>RDB resgate;</li>
+    <li>CDB aplicação;</li>
+    <li>CDB resgate;</li>
+    <li>campo obrigatório ausente;</li>
+    <li>tipo de operação inválido;</li>
+    <li>produto inválido;</li>
+    <li>clearing inválida;</li>
+    <li>data inválida;</li>
+    <li>valor inválido.</li>
+</ul>
+<h1>31. Testes de contrato dos Adapters</h1>
+<pre>
+entrada externa conhecida
+          ↓
+        Adapter
+          ↓
+modelo canônico esperado
+</pre>
+<p>
+    Se o time responsável pelo arquivo alterar uma coluna ou semântica,
+    os testes deverão evidenciar a quebra.
+</p>
+<h1>32. Testes dos validadores</h1>
+<pre>
+RDB válido
+→ válido
+RDB sem codigoRdb
+→ inválido
+RDB valor = -100
+→ inválido
+</pre>
+<h1>33. Testes de persistência</h1>
+<p>Deverão validar:</p>
+<pre>
+OperacaoRepository
+RegistroClearingRepository
+</pre>
+<p>Incluindo:</p>
+<pre>
+Put
+Get
+TransactWriteItems
+ConditionalWrite
+idempotência
+</pre>
+<h1>34. Teste de idempotência</h1>
+<p>Cenário obrigatório:</p>
+<pre>
+mesma operação
+      │
+      ├── processamento 1
+      └── processamento 2
+</pre>
+<p>Resultado:</p>
+<pre>
+OPERACOES
+→ 1 operação lógica
+REGISTROS_CLEARING
+→ 1 registro
+envio futuro
+→ não poderá ocorrer duas vezes devido à duplicação da ingestão
+</pre>
+<p>
+    Também deverá ser testado cenário concorrente.
+</p>
+<h1>35. Teste de atomicidade</h1>
+<p>Simular falha durante:</p>
+<pre>
+PUT OPERACOES
++
+PUT REGISTROS_CLEARING
+</pre>
+<p>
+    Validar que <code>TransactWriteItems</code> impede estado parcial.
+</p>
+<p>Resultado permitido:</p>
+<pre>
+ambos existem
+</pre>
+<p>ou:</p>
+<pre>
+nenhum existe
+</pre>
+<p>Nunca:</p>
+<pre>
+OPERACOES existe
+REGISTROS_CLEARING não existe
+</pre>
+<h1>36. Testes de integração</h1>
+<pre>
+arquivo de teste
+      ↓
+parser
+      ↓
+adapter
+      ↓
+validator
+      ↓
+DynamoDB
+</pre>
+<p>
+    Validar conteúdo final das duas tabelas.
+</p>
+<h1>37. Testes de carga</h1>
+<p>
+    Essa etapa é obrigatória devido à volumetria.
+</p>
+<p>Criar arquivos progressivos:</p>
+<pre>
+10 mil
+100 mil
+1 milhão
+5 milhões
+20 milhões
+</pre>
+<p>Se possível:</p>
+<pre>
+30 milhões
+</pre>
+<table>
+    <thead>
+        <tr>
+            <th>Métrica</th>
+            <th>Objetivo</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td>tempo total</td><td>determinar janela necessária</td></tr>
+        <tr><td>linhas/s</td><td>throughput</td></tr>
+        <tr><td>CPU</td><td>dimensionamento</td></tr>
+        <tr><td>memória</td><td>estabilidade</td></tr>
+        <tr><td>writes/s</td><td>capacidade DynamoDB</td></tr>
+        <tr><td>throttling</td><td>identificar gargalos</td></tr>
+        <tr><td>erros</td><td>confiabilidade</td></tr>
+        <tr><td>custo</td><td>dimensionamento</td></tr>
+    </tbody>
+</table>
+<h1>38. Teste de memória</h1>
+<pre>
+100 MB arquivo
+   ↓
+memória X
+10 GB arquivo
+   ↓
+memória aproximadamente X
+</pre>
+<p>
+    A variação deverá estar relacionada ao buffer, runtime e concorrência,
+    e não ao tamanho integral do arquivo.
+</p>
+<h1>39. Teste de falha e reprocessamento</h1>
+<pre>
+arquivo
+   ↓
+processa parcialmente
+   ↓
+job interrompido
+   ↓
+Batch executa novamente
+</pre>
+<p>Validar:</p>
+<pre>
+operações anteriores
+→ reconhecidas
+operações restantes
+→ persistidas
+duplicidade financeira
+→ zero
+</pre>
+<h1>40. Teste de linha inválida</h1>
+<pre>
+linha válida
+linha válida
+linha inválida
+linha válida
+</pre>
+<p>Resultado:</p>
+<pre>
+3 operações processadas
+1 rejeição registrada
+job continua
+</pre>
+<h1>41. Teste de arquivo inválido</h1>
+<pre>
+header incorreto
+layout desconhecido
+versão incompatível
+arquivo corrompido
+</pre>
+<p>
+    Nesse cenário, o job deverá falhar antes de iniciar processamento
+    financeiro relevante, quando possível.
+</p>
+<h1>42. Teste de Adapter independente da infraestrutura</h1>
+<p>
+    Deverá ser possível executar:
+</p>
+<pre><code>var operacao =
+    adapter.Adaptar(dto, contexto);</code></pre>
+<p>Sem:</p>
+<pre>
+S3
+DynamoDB
+EventBridge
+AWS Batch
+B3
+</pre>
+<p>
+    Isso permitirá testar toda a tradução de contrato
+    de forma rápida e isolada.
+</p>
+<h1>43. POC mínima</h1>
+<pre>
+S3
+ ↓
+EventBridge
+ ↓
+Batch
+ ↓
+streaming CSV
+ ↓
+Adapter RDB
+ ↓
+modelo canônico
+ ↓
+validação
+ ↓
+TransactWriteItems
+ ↓
+OPERACOES
++
+REGISTROS_CLEARING
+</pre>
+<p>
+    Utilizar inicialmente um arquivo pequeno para validação funcional
+    e depois executar carga progressiva.
+</p>
+<h1>44. Massa mínima da POC</h1>
+<pre>
+RDB aplicação válida
+RDB resgate válido
+CDB aplicação válida, se já suportado
+operação duplicada
+operação inválida
+clearing inválida
+valor inválido
+data inválida
+</pre>
+<h1>45. Requisitos</h1>
+<ol>
+    <li><strong>RF01.</strong> O EventBridge deverá iniciar o AWS Batch ao receber o evento configurado do S3.</li>
+    <li><strong>RF02.</strong> O Batch deverá receber bucket e chave do objeto como parâmetros.</li>
+    <li><strong>RF03.</strong> O arquivo deverá ser lido via streaming.</li>
+    <li><strong>RF04.</strong> O arquivo não deverá ser carregado integralmente em memória.</li>
+    <li><strong>RF05.</strong> O Parser deverá ser independente do Adapter.</li>
+    <li><strong>RF06.</strong> O Parser deverá transformar a representação física da linha em DTO externo.</li>
+    <li><strong>RF07.</strong> O Adapter deverá converter o DTO externo para o modelo canônico.</li>
+    <li><strong>RF08.</strong> O domínio não deverá conhecer o layout CSV.</li>
+    <li><strong>RF09.</strong> Deverá existir Adapter específico por contrato/produto quando houver diferenças relevantes de transformação.</li>
+    <li><strong>RF10.</strong> A seleção do Adapter deverá ser centralizada através de Resolver/Factory ou mecanismo equivalente.</li>
+    <li><strong>RF11.</strong> A inclusão de novo produto não deverá exigir alteração do fluxo principal de ingestão.</li>
+    <li><strong>RF12.</strong> O modelo produzido deverá seguir o contrato canônico versionado.</li>
+    <li><strong>RF13.</strong> O modelo deverá ser validado após adaptação.</li>
+    <li><strong>RF14.</strong> Deverão existir validações estruturais, canônicas e específicas de produto.</li>
+    <li><strong>RF15.</strong> Cada operação deverá receber idOperacao.</li>
+    <li><strong>RF16.</strong> Cada operação deverá possuir chaveIdempotencia.</li>
+    <li><strong>RF17.</strong> O processamento deverá ser idempotente.</li>
+    <li><strong>RF18.</strong> A idempotência deverá suportar concorrência.</li>
+    <li><strong>RF19.</strong> Operações válidas deverão ser persistidas em OPERACOES.</li>
+    <li><strong>RF20.</strong> Deverá ser criado estado inicial em REGISTROS_CLEARING.</li>
+    <li><strong>RF21.</strong> A criação de operação e registro deverá ser atomicamente consistente.</li>
+    <li><strong>RF22.</strong> Deverá ser avaliado/utilizado TransactWriteItems.</li>
+    <li><strong>RF23.</strong> Linhas inválidas não deverão necessariamente interromper o arquivo inteiro.</li>
+    <li><strong>RF24.</strong> Erros deverão ser classificados entre erro da linha e erro estrutural/técnico.</li>
+    <li><strong>RF25.</strong> A concorrência interna deverá ser limitada e configurável.</li>
+    <li><strong>RF26.</strong> A aplicação deverá produzir logs estruturados.</li>
+    <li><strong>RF27.</strong> A aplicação deverá produzir métricas de processamento.</li>
+    <li><strong>RF28.</strong> Não deverão ser produzidos logs INFO individualmente para todas as linhas.</li>
+    <li><strong>RF29.</strong> Retry do Batch não poderá gerar duplicidade.</li>
+    <li><strong>RF30.</strong> A infraestrutura deverá ser criada via Terraform.</li>
+    <li><strong>RF31.</strong> A aplicação deverá executar em container.</li>
+    <li><strong>RF32.</strong> A imagem deverá ser versionada.</li>
+    <li><strong>RF33.</strong> As permissões AWS deverão seguir princípio de menor privilégio.</li>
+    <li><strong>RF34.</strong> O Batch não deverá chamar diretamente a B3.</li>
+    <li><strong>RF35.</strong> A arquitetura deverá permitir futuramente uma entrada Kafka produzindo o mesmo modelo canônico.</li>
+</ol>
+<h1>46. Critérios de aceite</h1>
+<ol>
+    <li><strong>CA01.</strong> Upload de arquivo válido no local configurado inicia o processamento esperado.</li>
+    <li><strong>CA02.</strong> O Batch recebe corretamente bucket e object key.</li>
+    <li><strong>CA03.</strong> O arquivo é processado via streaming.</li>
+    <li><strong>CA04.</strong> O consumo de memória não cresce proporcionalmente ao tamanho integral do arquivo.</li>
+    <li><strong>CA05.</strong> O Parser interpreta corretamente o layout esperado.</li>
+    <li><strong>CA06.</strong> O Adapter RDB produz o modelo canônico esperado.</li>
+    <li><strong>CA07.</strong> O Adapter pode ser testado sem dependências AWS.</li>
+    <li><strong>CA08.</strong> Uma aplicação RDB válida é persistida corretamente.</li>
+    <li><strong>CA09.</strong> Um resgate RDB válido é persistido corretamente.</li>
+    <li><strong>CA10.</strong> OPERACOES recebe o envelope canônico e dadosOperacao.</li>
+    <li><strong>CA11.</strong> REGISTROS_CLEARING recebe o estado inicial esperado.</li>
+    <li><strong>CA12.</strong> A criação das duas estruturas não produz estado parcial.</li>
+    <li><strong>CA13.</strong> Uma operação duplicada não produz nova operação financeira.</li>
+    <li><strong>CA14.</strong> Duas tentativas concorrentes da mesma operação não produzem duplicidade.</li>
+    <li><strong>CA15.</strong> Uma linha inválida é identificada e contabilizada.</li>
+    <li><strong>CA16.</strong> Uma linha inválida não interrompe indevidamente todo o arquivo.</li>
+    <li><strong>CA17.</strong> Um arquivo estruturalmente inválido é rejeitado conforme política definida.</li>
+    <li><strong>CA18.</strong> Falha e retry do Batch não geram duplicidade.</li>
+    <li><strong>CA19.</strong> Logs permitem identificar arquivo, job e erro.</li>
+    <li><strong>CA20.</strong> Métricas apresentam quantidade processada, persistida, inválida e duplicada.</li>
+    <li><strong>CA21.</strong> Teste de carga demonstra throughput do Batch.</li>
+    <li><strong>CA22.</strong> Teste de carga demonstra utilização de CPU e memória.</li>
+    <li><strong>CA23.</strong> Teste de carga demonstra comportamento do DynamoDB.</li>
+    <li><strong>CA24.</strong> Não existe chamada direta do Batch para B3.</li>
+    <li><strong>CA25.</strong> Inclusão de um segundo Adapter não exige alteração relevante no fluxo principal.</li>
+    <li><strong>CA26.</strong> A configuração AWS está representada em Terraform.</li>
+</ol>
+<h1>47. Definição de pronto</h1>
+<p>
+    A história será considerada concluída quando estiverem
+    implementados e demonstrados:
+</p>
+<pre>
+Infraestrutura Batch
+        +
+Container .NET
+        +
+EventBridge
+        +
+Leitura streaming S3
+        +
+Parser CSV
+        +
+Adapter RDB
+        +
+Modelo canônico
+        +
+Validação
+        +
+Idempotência
+        +
+Persistência atômica
+        +
+OPERACOES
+        +
+REGISTROS_CLEARING
+        +
+Logs
+        +
+Métricas
+        +
+Testes unitários
+        +
+Testes de integração
+        +
+Teste de idempotência
+        +
+Teste de falha/retry
+        +
+Teste de carga
+</pre>
+<div class="success">
+    <strong>Resultado esperado:</strong>
+    o contrato de entrada deverá permanecer isolado do domínio,
+    e o Batch deverá conseguir ingerir grandes volumes sem acoplar
+    a plataforma de clearing ao formato do arquivo.
+</div>
+</body>
+</html>
