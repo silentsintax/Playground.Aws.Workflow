@@ -3531,3 +3531,1746 @@ Teste de carga
 </div>
 </body>
 </html>
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>H03 - Criar estrutura DynamoDB para operações, registros e histórico</title>
+<style>
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    line-height: 1.6;
+    color: #24292f;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 40px;
+}
+h1 {
+    color: #1f4e79;
+    border-bottom: 2px solid #d0d7de;
+    padding-bottom: 8px;
+    margin-top: 40px;
+}
+h2 {
+    color: #2f5f8f;
+    margin-top: 30px;
+}
+h3 {
+    color: #444;
+    margin-top: 24px;
+}
+pre {
+    background-color: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 16px;
+    overflow-x: auto;
+}
+code {
+    font-family: Consolas, Monaco, monospace;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 20px 0;
+}
+th, td {
+    border: 1px solid #d0d7de;
+    padding: 10px;
+    text-align: left;
+    vertical-align: top;
+}
+th {
+    background-color: #f6f8fa;
+}
+blockquote {
+    border-left: 4px solid #1f4e79;
+    padding: 10px 20px;
+    margin: 20px 0;
+    background-color: #f6f8fa;
+}
+.important {
+    background-color: #fff8c5;
+    border-left: 4px solid #d4a72c;
+    padding: 12px;
+    margin: 20px 0;
+}
+.success {
+    background-color: #dafbe1;
+    border-left: 4px solid #2da44e;
+    padding: 12px;
+    margin: 20px 0;
+}
+</style>
+</head>
+<body>
+<h1>Título</h1>
+<p>
+Criar estrutura DynamoDB para operações, registros e histórico
+do processo de registro em clearing.
+</p>
+<h1>Objetivo</h1>
+<p>
+Criar a estrutura de persistência DynamoDB da plataforma de registro
+em clearing utilizando três tabelas:
+</p>
+<ol>
+    <li><code>OPERACOES</code></li>
+    <li><code>REGISTROS_CLEARING</code></li>
+    <li><code>EVENTOS_REGISTRO</code></li>
+</ol>
+<p>A modelagem deverá suportar:</p>
+<ul>
+    <li>alta volumetria;</li>
+    <li>múltiplos produtos;</li>
+    <li>múltiplas clearings;</li>
+    <li>uma única clearing por operação;</li>
+    <li>origem inicial via CSV;</li>
+    <li>origem futura via Kafka;</li>
+    <li>idempotência;</li>
+    <li>correlação com sistemas externos;</li>
+    <li>rastreabilidade;</li>
+    <li>evolução dos contratos;</li>
+    <li>novos produtos sem remodelagem constante das tabelas;</li>
+    <li>novas clearings sem acoplamento do modelo interno ao contrato externo.</li>
+</ul>
+<p>
+A infraestrutura oficial deverá ser criada através de
+<strong>Terraform</strong>.
+</p>
+<p>
+Antes da implementação definitiva, as tabelas poderão ser criadas
+manualmente no AWS Console para realização da POC.
+</p>
+<h1>1. Princípio da modelagem</h1>
+<p>
+O DynamoDB não possui um schema rígido para todos os atributos dos itens.
+Entretanto, isso não significa que a aplicação não deverá possuir
+um contrato definido.
+</p>
+<p>
+A plataforma deverá possuir um
+<strong>modelo canônico explicitamente definido e versionado</strong>.
+</p>
+<blockquote>
+Ausência de schema físico no DynamoDB não significa ausência
+de contrato de domínio.
+</blockquote>
+<p>A estrutura seguirá o princípio:</p>
+<pre>
+          ITEM DYNAMODB
+                │
+       ┌────────┴────────┐
+       │                 │
+       ▼                 ▼
+ENVELOPE CANÔNICO    DADOS FLEXÍVEIS
+       │                 │
+       │                 ├── dadosOperacao
+       │                 ├── dadosRegistro
+       │                 └── dadosEvento
+       │
+       ├── identidade
+       ├── roteamento
+       ├── correlação
+       ├── idempotência
+       ├── controle
+       ├── auditoria
+       └── versão
+</pre>
+<h1>2. Regra para definição dos atributos</h1>
+<p>
+Um atributo deverá permanecer no primeiro nível do item quando for
+necessário para pelo menos uma das seguintes finalidades:
+</p>
+<ul>
+    <li>Partition Key;</li>
+    <li>Sort Key;</li>
+    <li>Global Secondary Index;</li>
+    <li>identificação;</li>
+    <li>correlação;</li>
+    <li>roteamento;</li>
+    <li>idempotência;</li>
+    <li>controle do workflow;</li>
+    <li>versionamento;</li>
+    <li>auditoria.</li>
+</ul>
+<p>
+Dados específicos do produto, clearing, operação ou evento deverão,
+preferencialmente, ficar dentro do Map correspondente.
+</p>
+<h1>3. Independência das origens</h1>
+<p>
+O modelo DynamoDB não deverá representar diretamente o contrato
+do CSV, Kafka ou qualquer outra origem.
+</p>
+<pre>
+CSV
+ │
+ ▼
+Adapter CSV
+ │
+ └───────────────┐
+                 │
+                 ▼
+          MODELO CANÔNICO
+                 ▲
+                 │
+Kafka Adapter ───┘
+ ▲
+ │
+Kafka
+</pre>
+<p>
+A plataforma deverá persistir o mesmo modelo canônico
+independentemente da origem.
+</p>
+<h1>4. Independência das clearings</h1>
+<p>
+O modelo também não deverá representar diretamente o contrato
+da B3 ou de outra clearing.
+</p>
+<pre>
+             MODELO CANÔNICO
+                    │
+                    ▼
+             Clearing Router
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+      Adapter B3 Adapter X Adapter Y
+          │         │         │
+          ▼         ▼         ▼
+          B3    Clearing X Clearing Y
+</pre>
+<blockquote>
+A estrutura DynamoDB pertence ao domínio da plataforma de clearing
+e não às interfaces externas.
+</blockquote>
+<h1>5. Visão geral das tabelas</h1>
+<pre>
+                    OPERACOES
+                       │
+                       │ 1 : 1
+                       ▼
+              REGISTROS_CLEARING
+                       │
+                       │ 1 : N
+                       ▼
+                EVENTOS_REGISTRO
+</pre>
+<table>
+<thead>
+<tr>
+    <th>Tabela</th>
+    <th>Responsabilidade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+    <td>OPERACOES</td>
+    <td>Dado canônico da operação financeira.</td>
+</tr>
+<tr>
+    <td>REGISTROS_CLEARING</td>
+    <td>Estado operacional atual do registro da operação.</td>
+</tr>
+<tr>
+    <td>EVENTOS_REGISTRO</td>
+    <td>Histórico append-only do processo de registro.</td>
+</tr>
+</tbody>
+</table>
+<h1>6. Tabela OPERACOES</h1>
+<h2>Finalidade</h2>
+<p>
+Representar uma operação financeira recebida pela plataforma.
+</p>
+<p>
+Cada operação deverá possuir exatamente
+<strong>uma clearing de destino</strong>.
+</p>
+<h2>Chaves</h2>
+<pre>
+PK = idOperacao
+SK = não possui
+</pre>
+<p>
+A ausência de Sort Key é intencional.
+</p>
+<p>
+Existe exatamente um item de operação para cada
+<code>idOperacao</code>.
+</p>
+<p>
+Adicionar uma SK constante não acrescentaria um novo padrão
+de acesso e aumentaria desnecessariamente a modelagem.
+</p>
+<h1>7. Estrutura da tabela OPERACOES</h1>
+<table>
+<thead>
+<tr>
+    <th>Campo</th>
+    <th>Tipo</th>
+    <th>Obrigatório</th>
+    <th>Finalidade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>idOperacao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Partition Key e identificador interno da operação.</td>
+</tr>
+<tr>
+<td>produto</td>
+<td>String</td>
+<td>Sim</td>
+<td>Produto financeiro, como RDB, CDB etc.</td>
+</tr>
+<tr>
+<td>tipoOperacao</td>
+<td>String</td>
+<td>Sim</td>
+<td>APLICACAO ou RESGATE.</td>
+</tr>
+<tr>
+<td>clearingDestino</td>
+<td>String</td>
+<td>Sim</td>
+<td>Clearing responsável pelo registro.</td>
+</tr>
+<tr>
+<td>chaveIdempotencia</td>
+<td>String</td>
+<td>Sim</td>
+<td>Identidade lógica utilizada na estratégia de idempotência.</td>
+</tr>
+<tr>
+<td>versaoModelo</td>
+<td>Number</td>
+<td>Sim</td>
+<td>Versão do contrato canônico.</td>
+</tr>
+<tr>
+<td>origem</td>
+<td>Map</td>
+<td>Sim</td>
+<td>Informações sobre a origem da operação.</td>
+</tr>
+<tr>
+<td>dataHoraInclusao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Auditoria.</td>
+</tr>
+<tr>
+<td>dataHoraAlteracao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Auditoria.</td>
+</tr>
+<tr>
+<td>dadosOperacao</td>
+<td>Map</td>
+<td>Sim</td>
+<td>Dados específicos do produto/operação.</td>
+</tr>
+</tbody>
+</table>
+<h1>8. Representação de OPERACOES</h1>
+<pre>
+OPERACOES
+│
+├── idOperacao                PK
+├── produto
+├── tipoOperacao
+├── clearingDestino
+├── chaveIdempotencia
+├── versaoModelo
+├── origem
+│   ├── tipo
+│   └── identificador
+│
+├── dataHoraInclusao
+├── dataHoraAlteracao
+│
+└── dadosOperacao
+      └── Map flexível
+</pre>
+<h1>9. dadosOperacao</h1>
+<p>
+O campo <code>dadosOperacao</code> deverá armazenar informações
+específicas do produto e da operação.
+</p>
+<p>Exemplos:</p>
+<ul>
+    <li>valor;</li>
+    <li>data da operação;</li>
+    <li>vencimento;</li>
+    <li>taxa;</li>
+    <li>indexador;</li>
+    <li>código do instrumento;</li>
+    <li>dados específicos do RDB;</li>
+    <li>dados específicos do CDB;</li>
+    <li>futuros campos de novos produtos.</li>
+</ul>
+<h1>10. Exemplo de operação RDB</h1>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "produto": "RDB",
+  "tipoOperacao": "APLICACAO",
+  "clearingDestino": "B3",
+  "chaveIdempotencia": "ARQUIVO#20261005#000001",
+  "versaoModelo": 1,
+  "origem": {
+    "tipo": "ARQUIVO",
+    "identificador": "ARQ-000001"
+  },
+  "dataHoraInclusao": "2026-10-05T10:00:00.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:00:00.000Z",
+  "dadosOperacao": {
+    "valor": 15000.50,
+    "dataOperacao": "2026-10-05",
+    "codigoRdb": "RDB001",
+    "dataVencimento": "2028-10-05",
+    "taxa": 0.125
+  }
+}</code></pre>
+<h1>11. Exemplo de operação CDB</h1>
+<pre><code>{
+  "idOperacao": "OP-000003",
+  "produto": "CDB",
+  "tipoOperacao": "APLICACAO",
+  "clearingDestino": "B3",
+  "chaveIdempotencia": "ARQUIVO#20261005#000003",
+  "versaoModelo": 1,
+  "origem": {
+    "tipo": "ARQUIVO",
+    "identificador": "ARQ-000003"
+  },
+  "dataHoraInclusao": "2026-10-05T10:02:00.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:02:00.000Z",
+  "dadosOperacao": {
+    "valor": 25000.00,
+    "dataOperacao": "2026-10-05",
+    "codigoCdb": "CDB001",
+    "indexador": "CDI",
+    "percentualIndexador": 105,
+    "dataVencimento": "2029-10-05"
+  }
+}</code></pre>
+<h1>12. Versionamento do modelo</h1>
+<p>
+O campo <code>versaoModelo</code> deverá identificar explicitamente
+a versão do contrato canônico.
+</p>
+<pre>
+produto = RDB
+versaoModelo = 1
+        ↓
+ValidadorRdbV1
+produto = RDB
+versaoModelo = 2
+        ↓
+ValidadorRdbV2
+</pre>
+<p>
+Isso permitirá evolução controlada sem reinterpretar silenciosamente
+dados históricos.
+</p>
+<h1>13. Idempotência</h1>
+<p>
+A tabela <code>OPERACOES</code> deverá possuir
+<code>chaveIdempotencia</code>.
+</p>
+<p>Exemplo para arquivo:</p>
+<pre>
+ARQUIVO#20261005#000001
+</pre>
+<p>Exemplo futuro para Kafka:</p>
+<pre>
+KAFKA#TOPICO-OPERACOES#12#987654
+</pre>
+<p>Poderá ser avaliado o GSI:</p>
+<pre>
+INDICE_IDEMPOTENCIA
+PK = chaveIdempotencia
+</pre>
+<div class="important">
+<strong>Importante:</strong>
+um GSI não deverá ser utilizado sozinho como mecanismo
+de garantia de unicidade.
+</div>
+<p>
+A estratégia definitiva deverá considerar concorrência e
+escrita condicional e/ou uma estrutura dedicada ao controle
+de idempotência.
+</p>
+<h1>14. Tabela REGISTROS_CLEARING</h1>
+<h2>Finalidade</h2>
+<p>
+Representar o estado operacional atual do registro
+da operação na clearing.
+</p>
+<pre>
+OPERACAO 1 ───────── 1 REGISTRO_CLEARING
+</pre>
+<h2>Chaves</h2>
+<pre>
+PK = idOperacao
+SK = não possui
+</pre>
+<p>
+A ausência de Sort Key também é intencional.
+</p>
+<pre>
+uma operação
+      │
+      ▼
+um registro atual
+</pre>
+<h1>15. Estrutura da tabela REGISTROS_CLEARING</h1>
+<table>
+<thead>
+<tr>
+    <th>Campo</th>
+    <th>Tipo</th>
+    <th>Obrigatório</th>
+    <th>Finalidade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>idOperacao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Partition Key.</td>
+</tr>
+<tr>
+<td>idRegistro</td>
+<td>String</td>
+<td>Sim</td>
+<td>Identificador interno do registro.</td>
+</tr>
+<tr>
+<td>clearing</td>
+<td>String</td>
+<td>Sim</td>
+<td>Clearing utilizada.</td>
+</tr>
+<tr>
+<td>status</td>
+<td>String</td>
+<td>Sim</td>
+<td>Estado operacional atual.</td>
+</tr>
+<tr>
+<td>idExterno</td>
+<td>String</td>
+<td>Não</td>
+<td>Identificador retornado/utilizado pelo sistema externo.</td>
+</tr>
+<tr>
+<td>tentativa</td>
+<td>Number</td>
+<td>Sim</td>
+<td>Número da tentativa atual.</td>
+</tr>
+<tr>
+<td>versaoModelo</td>
+<td>Number</td>
+<td>Sim</td>
+<td>Versão do contrato.</td>
+</tr>
+<tr>
+<td>dataHoraInclusao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Auditoria.</td>
+</tr>
+<tr>
+<td>dataHoraAlteracao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Auditoria.</td>
+</tr>
+<tr>
+<td>dadosRegistro</td>
+<td>Map</td>
+<td>Não</td>
+<td>Dados variáveis do processo de registro.</td>
+</tr>
+</tbody>
+</table>
+<h1>16. Representação de REGISTROS_CLEARING</h1>
+<pre>
+REGISTROS_CLEARING
+│
+├── idOperacao             PK
+├── idRegistro
+├── clearing
+├── status
+├── idExterno
+├── tentativa
+├── versaoModelo
+├── dataHoraInclusao
+├── dataHoraAlteracao
+│
+└── dadosRegistro
+      └── Map flexível
+</pre>
+<h1>17. dadosRegistro</h1>
+<p>
+Informações específicas da clearing ou do processamento que não
+sejam necessárias para consulta, correlação ou controle poderão
+ficar dentro de <code>dadosRegistro</code>.
+</p>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "idRegistro": "REG-000001",
+  "clearing": "B3",
+  "status": "REGISTRADO",
+  "idExterno": "B3-20261005-000001",
+  "tentativa": 1,
+  "versaoModelo": 1,
+  "dataHoraInclusao": "2026-10-05T10:00:10.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:05:00.000Z",
+  "dadosRegistro": {
+    "protocolo": "PROTOCOLO-B3-001",
+    "codigoRetorno": "00",
+    "mensagemRetorno": "Registro realizado com sucesso"
+  }
+}</code></pre>
+<p>
+O campo <code>idExterno</code> deverá permanecer no primeiro nível,
+pois será utilizado para correlação e consulta.
+</p>
+<h1>18. GSI de correlação externa</h1>
+<p>Deverá ser criado:</p>
+<pre>
+INDICE_ID_EXTERNO
+PK = idExterno
+</pre>
+<p>Fluxo conceitual:</p>
+<pre>
+Sistema externo
+      │
+      │ retorno
+      ▼
+     SNS
+      │
+      ▼
+SQS RETORNO
+      │
+      ▼
+Return Worker
+      │
+      │ idExterno
+      ▼
+INDICE_ID_EXTERNO
+      │
+      ▼
+idOperacao
+</pre>
+<p>
+Isso permitirá localizar rapidamente a operação interna
+utilizando o identificador retornado pelo sistema externo.
+</p>
+<h1>19. Tabela EVENTOS_REGISTRO</h1>
+<h2>Finalidade</h2>
+<p>
+Armazenar a timeline <strong>append-only</strong> do processo
+de registro.
+</p>
+<pre>
+OP-000001
+   │
+   ├── REGISTRO_CRIADO
+   ├── ENVIO_INICIADO
+   ├── ENVIADO_CLEARING
+   └── REGISTRADO
+</pre>
+<h2>Chaves</h2>
+<pre>
+PK = idOperacao
+SK = chaveEvento
+</pre>
+<p>A Sort Key deverá possuir o formato:</p>
+<pre>
+&lt;dataHoraEvento&gt;#&lt;idEvento&gt;
+</pre>
+<p>Exemplo:</p>
+<pre>
+2026-10-05T10:00:10.000Z#EVT-001
+2026-10-05T10:01:00.000Z#EVT-002
+2026-10-05T10:02:00.000Z#EVT-003
+2026-10-05T10:05:00.000Z#EVT-004
+</pre>
+<p>
+Isso permitirá recuperar o histórico da operação já ordenado
+cronologicamente.
+</p>
+<h1>20. Estrutura da tabela EVENTOS_REGISTRO</h1>
+<table>
+<thead>
+<tr>
+    <th>Campo</th>
+    <th>Tipo</th>
+    <th>Obrigatório</th>
+    <th>Finalidade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>idOperacao</td>
+<td>String</td>
+<td>Sim</td>
+<td>Partition Key.</td>
+</tr>
+<tr>
+<td>chaveEvento</td>
+<td>String</td>
+<td>Sim</td>
+<td>Sort Key cronológica.</td>
+</tr>
+<tr>
+<td>idEvento</td>
+<td>String</td>
+<td>Sim</td>
+<td>Identificador único do evento.</td>
+</tr>
+<tr>
+<td>idRegistro</td>
+<td>String</td>
+<td>Sim</td>
+<td>Correlação com o registro.</td>
+</tr>
+<tr>
+<td>tipoEvento</td>
+<td>String</td>
+<td>Sim</td>
+<td>Tipo do evento.</td>
+</tr>
+<tr>
+<td>statusAnterior</td>
+<td>String</td>
+<td>Não</td>
+<td>Estado anterior.</td>
+</tr>
+<tr>
+<td>statusAtual</td>
+<td>String</td>
+<td>Não</td>
+<td>Novo estado.</td>
+</tr>
+<tr>
+<td>origemEvento</td>
+<td>String</td>
+<td>Sim</td>
+<td>Componente responsável pelo evento.</td>
+</tr>
+<tr>
+<td>dataHoraEvento</td>
+<td>String</td>
+<td>Sim</td>
+<td>Data/hora do evento.</td>
+</tr>
+<tr>
+<td>versaoModelo</td>
+<td>Number</td>
+<td>Sim</td>
+<td>Versão do contrato.</td>
+</tr>
+<tr>
+<td>dadosEvento</td>
+<td>Map</td>
+<td>Não</td>
+<td>Payload específico do evento.</td>
+</tr>
+</tbody>
+</table>
+<h1>21. Representação de EVENTOS_REGISTRO</h1>
+<pre>
+EVENTOS_REGISTRO
+│
+├── idOperacao             PK
+├── chaveEvento            SK
+├── idEvento
+├── idRegistro
+├── tipoEvento
+├── statusAnterior
+├── statusAtual
+├── origemEvento
+├── dataHoraEvento
+├── versaoModelo
+│
+└── dadosEvento
+      └── Map flexível
+</pre>
+<h1>22. Exemplo de evento de sucesso</h1>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "chaveEvento":
+    "2026-10-05T10:05:00.000Z#EVT-004",
+  "idEvento": "EVT-004",
+  "idRegistro": "REG-000001",
+  "tipoEvento": "STATUS_ALTERADO",
+  "statusAnterior": "ENVIADO",
+  "statusAtual": "REGISTRADO",
+  "origemEvento": "RETORNO_CLEARING",
+  "dataHoraEvento":
+    "2026-10-05T10:05:00.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {
+    "idExterno": "B3-20261005-000001",
+    "protocolo": "PROTOCOLO-B3-001",
+    "codigoRetorno": "00",
+    "mensagem": "Registro realizado com sucesso"
+  }
+}</code></pre>
+<h1>23. Exemplo de evento de erro</h1>
+<pre><code>{
+  "idOperacao": "OP-000003",
+  "chaveEvento":
+    "2026-10-05T10:07:00.000Z#EVT-010",
+  "idEvento": "EVT-010",
+  "idRegistro": "REG-000003",
+  "tipoEvento": "ERRO_REGISTRO",
+  "statusAnterior": "EM_PROCESSAMENTO",
+  "statusAtual": "ERRO",
+  "origemEvento": "ADAPTER_B3",
+  "dataHoraEvento":
+    "2026-10-05T10:07:00.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {
+    "codigoErro": "B3-001",
+    "descricao": "Instrumento não encontrado",
+    "tentativa": 2,
+    "reprocessavel": true
+  }
+}</code></pre>
+<h1>24. Resumo das chaves</h1>
+<table>
+<thead>
+<tr>
+    <th>Tabela</th>
+    <th>Partition Key</th>
+    <th>Sort Key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OPERACOES</td>
+<td>idOperacao</td>
+<td>Não possui</td>
+</tr>
+<tr>
+<td>REGISTROS_CLEARING</td>
+<td>idOperacao</td>
+<td>Não possui</td>
+</tr>
+<tr>
+<td>EVENTOS_REGISTRO</td>
+<td>idOperacao</td>
+<td>chaveEvento</td>
+</tr>
+</tbody>
+</table>
+<h1>25. Resumo dos GSIs</h1>
+<table>
+<thead>
+<tr>
+    <th>Tabela</th>
+    <th>Índice</th>
+    <th>Partition Key</th>
+    <th>Finalidade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OPERACOES</td>
+<td>INDICE_IDEMPOTENCIA</td>
+<td>chaveIdempotencia</td>
+<td>Localizar operação pela identidade lógica. Uso definitivo depende da estratégia de idempotência.</td>
+</tr>
+<tr>
+<td>REGISTROS_CLEARING</td>
+<td>INDICE_ID_EXTERNO</td>
+<td>idExterno</td>
+<td>Localizar operação através do identificador externo.</td>
+</tr>
+<tr>
+<td>EVENTOS_REGISTRO</td>
+<td>Nenhum inicialmente</td>
+<td>-</td>
+<td>O padrão inicial é consultar histórico diretamente por idOperacao.</td>
+</tr>
+</tbody>
+</table>
+<h1>26. Atomicidade entre registro e histórico</h1>
+<p>
+Quando ocorrer uma alteração de estado, o snapshot atual e
+o histórico deverão permanecer consistentes.
+</p>
+<p>Exemplo:</p>
+<pre>
+ENVIADO
+   │
+   ▼
+REGISTRADO
+</pre>
+<p>A alteração poderá utilizar:</p>
+<pre>
+TransactWriteItems
+       │
+       ├── UPDATE REGISTROS_CLEARING
+       │
+       │      status = REGISTRADO
+       │
+       └── PUT EVENTOS_REGISTRO
+              ENVIADO → REGISTRADO
+</pre>
+<p>Resultado:</p>
+<pre>
+TUDO
+ OU
+NADA
+</pre>
+<p>
+Não deverá existir situação final em que o status esteja atualizado
+sem que o evento correspondente tenha sido persistido, ou vice-versa.
+</p>
+<h1>27. DynamoDB Streams</h1>
+<p>
+Somente <code>OPERACOES</code> deverá possuir inicialmente o Stream
+utilizado para iniciar o fluxo de registro.
+</p>
+<pre>
+OPERACOES
+    │
+    ▼
+DynamoDB Streams
+    │
+    ▼
+EventBridge Pipes
+    │
+    ▼
+SQS REGISTRO
+</pre>
+<p>
+Alterações em <code>REGISTROS_CLEARING</code> e
+<code>EVENTOS_REGISTRO</code> não deverão iniciar automaticamente
+um novo envio para clearing.
+</p>
+<h1>28. Configuração manual para POC</h1>
+<h2>OPERACOES</h2>
+<table>
+<tbody>
+<tr><th>Configuração</th><th>Valor</th></tr>
+<tr><td>Table name</td><td>OPERACOES</td></tr>
+<tr><td>Partition key</td><td>idOperacao</td></tr>
+<tr><td>Partition key type</td><td>String</td></tr>
+<tr><td>Sort key</td><td>Não</td></tr>
+<tr><td>Capacity mode</td><td>On-demand</td></tr>
+<tr><td>Stream</td><td>Habilitado para POC</td></tr>
+<tr><td>GSI opcional</td><td>INDICE_IDEMPOTENCIA</td></tr>
+<tr><td>GSI Partition Key</td><td>chaveIdempotencia</td></tr>
+</tbody>
+</table>
+<h2>REGISTROS_CLEARING</h2>
+<table>
+<tbody>
+<tr><th>Configuração</th><th>Valor</th></tr>
+<tr><td>Table name</td><td>REGISTROS_CLEARING</td></tr>
+<tr><td>Partition key</td><td>idOperacao</td></tr>
+<tr><td>Partition key type</td><td>String</td></tr>
+<tr><td>Sort key</td><td>Não</td></tr>
+<tr><td>Capacity mode</td><td>On-demand</td></tr>
+<tr><td>GSI</td><td>INDICE_ID_EXTERNO</td></tr>
+<tr><td>GSI Partition Key</td><td>idExterno</td></tr>
+</tbody>
+</table>
+<h2>EVENTOS_REGISTRO</h2>
+<table>
+<tbody>
+<tr><th>Configuração</th><th>Valor</th></tr>
+<tr><td>Table name</td><td>EVENTOS_REGISTRO</td></tr>
+<tr><td>Partition key</td><td>idOperacao</td></tr>
+<tr><td>Partition key type</td><td>String</td></tr>
+<tr><td>Sort key</td><td>chaveEvento</td></tr>
+<tr><td>Sort key type</td><td>String</td></tr>
+<tr><td>Capacity mode</td><td>On-demand</td></tr>
+<tr><td>Stream</td><td>Não</td></tr>
+<tr><td>GSI</td><td>Nenhum inicialmente</td></tr>
+</tbody>
+</table>
+<h1>29. Massa da POC</h1>
+<p>
+A POC deverá possuir ao menos os seguintes cenários:
+</p>
+<pre>
+OP-000001 | RDB | APLICACAO | B3 | REGISTRADO
+OP-000002 | RDB | RESGATE   | B3 | EM_PROCESSAMENTO
+OP-000003 | CDB | APLICACAO | B3 | ERRO
+OP-000004 | RDB | APLICACAO | B3 | PENDENTE
+</pre>
+<p>
+Os itens deverão seguir o modelo de envelope canônico +
+Maps definido nesta história.
+</p>
+<h1>30. Massa POC - Operação 1</h1>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "produto": "RDB",
+  "tipoOperacao": "APLICACAO",
+  "clearingDestino": "B3",
+  "chaveIdempotencia": "ARQUIVO#20261005#000001",
+  "versaoModelo": 1,
+  "origem": {
+    "tipo": "ARQUIVO",
+    "identificador": "ARQ-000001"
+  },
+  "dataHoraInclusao": "2026-10-05T10:00:00.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:00:00.000Z",
+  "dadosOperacao": {
+    "valor": 15000.50,
+    "dataOperacao": "2026-10-05",
+    "codigoRdb": "RDB001"
+  }
+}</code></pre>
+<h1>31. Massa POC - Registro 1</h1>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "idRegistro": "REG-000001",
+  "clearing": "B3",
+  "status": "REGISTRADO",
+  "idExterno": "B3-20261005-000001",
+  "tentativa": 1,
+  "versaoModelo": 1,
+  "dataHoraInclusao": "2026-10-05T10:00:10.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:05:00.000Z",
+  "dadosRegistro": {
+    "protocolo": "PROTOCOLO-B3-001",
+    "codigoRetorno": "00"
+  }
+}</code></pre>
+<h1>32. Massa POC - Eventos da operação 1</h1>
+<h2>Registro criado</h2>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "chaveEvento": "2026-10-05T10:00:10.000Z#EVT-001",
+  "idEvento": "EVT-001",
+  "idRegistro": "REG-000001",
+  "tipoEvento": "REGISTRO_CRIADO",
+  "statusAtual": "PENDENTE",
+  "origemEvento": "INGESTAO",
+  "dataHoraEvento": "2026-10-05T10:00:10.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {}
+}</code></pre>
+<h2>Enviado</h2>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "chaveEvento": "2026-10-05T10:02:00.000Z#EVT-002",
+  "idEvento": "EVT-002",
+  "idRegistro": "REG-000001",
+  "tipoEvento": "STATUS_ALTERADO",
+  "statusAnterior": "PENDENTE",
+  "statusAtual": "ENVIADO",
+  "origemEvento": "REGISTRATION_WORKER",
+  "dataHoraEvento": "2026-10-05T10:02:00.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {}
+}</code></pre>
+<h2>Registrado</h2>
+<pre><code>{
+  "idOperacao": "OP-000001",
+  "chaveEvento": "2026-10-05T10:05:00.000Z#EVT-003",
+  "idEvento": "EVT-003",
+  "idRegistro": "REG-000001",
+  "tipoEvento": "STATUS_ALTERADO",
+  "statusAnterior": "ENVIADO",
+  "statusAtual": "REGISTRADO",
+  "origemEvento": "RETORNO_CLEARING",
+  "dataHoraEvento": "2026-10-05T10:05:00.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {
+    "idExterno": "B3-20261005-000001",
+    "protocolo": "PROTOCOLO-B3-001"
+  }
+}</code></pre>
+<h1>33. Consultar uma operação</h1>
+<pre>
+Tabela: OPERACOES
+Operação:
+GetItem
+Partition Key:
+idOperacao = OP-000001
+</pre>
+<p>
+Essa consulta deverá ser direta, sem Scan.
+</p>
+<h1>34. Consultar estado atual do registro</h1>
+<pre>
+Tabela: REGISTROS_CLEARING
+Operação:
+GetItem
+Partition Key:
+idOperacao = OP-000001
+</pre>
+<h1>35. Consultar todo o histórico de uma operação</h1>
+<pre>
+Tabela: EVENTOS_REGISTRO
+Operação:
+Query
+Partition Key:
+idOperacao = OP-000001
+</pre>
+<p>Resultado esperado:</p>
+<pre>
+2026-10-05T10:00:10.000Z#EVT-001
+2026-10-05T10:02:00.000Z#EVT-002
+2026-10-05T10:05:00.000Z#EVT-003
+</pre>
+<p>
+Como <code>chaveEvento</code> é a Sort Key, o DynamoDB
+retornará naturalmente os eventos ordenados.
+</p>
+<h1>36. Consultar o último evento</h1>
+<pre>
+Tabela: EVENTOS_REGISTRO
+idOperacao = OP-000001
+ScanIndexForward = false
+Limit = 1
+</pre>
+<p>
+Isso permite recuperar o último evento sem realizar
+Scan completo da tabela.
+</p>
+<h1>37. Localizar operação pelo idExterno</h1>
+<pre>
+Tabela:
+REGISTROS_CLEARING
+Índice:
+INDICE_ID_EXTERNO
+Partition Key:
+idExterno = B3-20261005-000001
+</pre>
+<p>Resultado:</p>
+<pre>
+idOperacao = OP-000001
+</pre>
+<h1>38. Consultar operação pela chave de idempotência</h1>
+<p>
+Caso <code>INDICE_IDEMPOTENCIA</code> seja utilizado:
+</p>
+<pre>
+Tabela:
+OPERACOES
+Índice:
+INDICE_IDEMPOTENCIA
+Partition Key:
+chaveIdempotencia =
+ARQUIVO#20261005#000001
+</pre>
+<div class="important">
+Esta consulta é útil para localização, mas não deverá ser considerada
+sozinha como garantia transacional contra duplicidade.
+</div>
+<h1>39. Consultas analíticas</h1>
+<p>
+Não deverão ser criados GSIs indiscriminadamente apenas para atender
+consultas analíticas como:
+</p>
+<ul>
+    <li>listar todas as operações;</li>
+    <li>listar operações por produto;</li>
+    <li>listar operações por clearing;</li>
+    <li>total em processo de registro;</li>
+    <li>total registrado;</li>
+    <li>total com erro;</li>
+    <li>dashboard por período;</li>
+    <li>relatórios operacionais.</li>
+</ul>
+<p>
+Esses padrões deverão ser avaliados posteriormente através de um
+<strong>read model</strong>.
+</p>
+<p>Exemplo futuro:</p>
+<pre>
+DynamoDB
+   │
+   ▼
+Exportação / ETL
+   │
+   ▼
+S3
+   │
+   ▼
+Athena
+   │
+   ├── API de consulta
+   │
+   └── Dashboard
+</pre>
+<p>
+A estrutura definida nesta história deverá ser otimizada principalmente
+para o fluxo transacional de registro.
+</p>
+<h1>40. Volumetria</h1>
+<p>
+Considerando conceitualmente 20 milhões de operações:
+</p>
+<pre>
+OPERACOES
+≈ 20 milhões de itens
+</pre>
+<pre>
+REGISTROS_CLEARING
+≈ 20 milhões de itens
++
+atualizações de estado
+</pre>
+<p>
+A tabela que apresentará crescimento significativamente maior
+será <code>EVENTOS_REGISTRO</code>.
+</p>
+<p>
+Com uma média hipotética de cinco eventos por operação:
+</p>
+<pre>
+20 milhões de operações
+×
+5 eventos
+=
+100 milhões de eventos
+</pre>
+<div class="important">
+Os números acima são ilustrativos. O objetivo é demonstrar
+a diferença de comportamento de crescimento entre as três tabelas.
+</div>
+<h1>41. Distribuição das partições</h1>
+<p>
+As Partition Keys não deverão utilizar valores de baixa cardinalidade,
+como:
+</p>
+<pre>
+B3
+RDB
+REGISTRADO
+ERRO
+</pre>
+<p>
+Utilizar esses valores como PK poderia concentrar grande volume
+de operações na mesma chave lógica.
+</p>
+<p>
+O identificador <code>idOperacao</code> deverá fornecer alta
+cardinalidade e distribuição adequada.
+</p>
+<h1>42. Por que utilizar três tabelas</h1>
+<p>
+As três estruturas possuem comportamentos diferentes.
+</p>
+<table>
+<thead>
+<tr>
+    <th>Tabela</th>
+    <th>Comportamento</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OPERACOES</td>
+<td>Principalmente escrita inicial e leitura.</td>
+</tr>
+<tr>
+<td>REGISTROS_CLEARING</td>
+<td>Atualizações frequentes do estado operacional.</td>
+</tr>
+<tr>
+<td>EVENTOS_REGISTRO</td>
+<td>Append-only e crescimento muito maior.</td>
+</tr>
+</tbody>
+</table>
+<p>
+A separação permite tratar capacidade, retenção, índices,
+observabilidade e evolução de cada tabela independentemente.
+</p>
+<h1>43. OPERACOES x REGISTROS_CLEARING</h1>
+<p>
+As tabelas não deverão ser consideradas redundantes.
+</p>
+<p>
+<code>OPERACOES</code> representa:
+</p>
+<pre>
+O QUE é a operação financeira?
+</pre>
+<p>
+<code>REGISTROS_CLEARING</code> representa:
+</p>
+<pre>
+QUAL é o estado atual do processo
+de registro dessa operação?
+</pre>
+<p>
+<code>EVENTOS_REGISTRO</code> representa:
+</p>
+<pre>
+COMO o processo chegou
+ao estado atual?
+</pre>
+<p>Portanto:</p>
+<pre>
+OPERACOES
+    ↓
+fato de negócio
+REGISTROS_CLEARING
+    ↓
+snapshot operacional
+EVENTOS_REGISTRO
+    ↓
+timeline/auditoria
+</pre>
+<h1>44. Reprocessamento futuro</h1>
+<p>
+A estrutura deverá permitir futuramente reprocessamento de operações
+com erro ou estados reprocessáveis.
+</p>
+<p>Exemplo:</p>
+<pre>
+REGISTROS_CLEARING
+status = ERRO
+tentativa = 2
+       │
+       ▼
+Reprocessamento
+       │
+       ▼
+status = PENDENTE_REPROCESSAMENTO
+tentativa = 3
+</pre>
+<p>
+Cada mudança deverá produzir um novo evento em
+<code>EVENTOS_REGISTRO</code>.
+</p>
+<h1>45. Conciliação futura</h1>
+<p>
+A arquitetura também deverá permitir futuramente comparar o estado
+interno da plataforma com informações fornecidas pela clearing.
+</p>
+<pre>
+Estado interno
+REGISTROS_CLEARING
+        │
+        │ comparação
+        ▼
+Retorno / posição Clearing
+        │
+        ▼
+Conciliação
+</pre>
+<p>
+Caso seja encontrada divergência, poderá ser produzido um novo
+evento de domínio/auditoria sem alterar os eventos históricos anteriores.
+</p>
+<h1>46. Modelo lógico para PowerDesigner</h1>
+<p>
+No modelo lógico, representar as três entidades:
+</p>
+<pre>
+OPERACAO
+│
+│ 1
+│
+│
+│ 1
+▼
+REGISTRO_CLEARING
+│
+│ 1
+│
+│ N
+▼
+EVENTO_REGISTRO
+</pre>
+<h2>OPERACAO</h2>
+<pre>
+idOperacao
+produto
+tipoOperacao
+clearingDestino
+chaveIdempotencia
+versaoModelo
+origem
+dataHoraInclusao
+dataHoraAlteracao
+dadosOperacao
+</pre>
+<h2>REGISTRO_CLEARING</h2>
+<pre>
+idOperacao
+idRegistro
+clearing
+status
+idExterno
+tentativa
+versaoModelo
+dataHoraInclusao
+dataHoraAlteracao
+dadosRegistro
+</pre>
+<h2>EVENTO_REGISTRO</h2>
+<pre>
+idOperacao
+chaveEvento
+idEvento
+idRegistro
+tipoEvento
+statusAnterior
+statusAtual
+origemEvento
+dataHoraEvento
+versaoModelo
+dadosEvento
+</pre>
+<h1>47. Modelo físico para PowerDesigner</h1>
+<h2>OPERACOES</h2>
+<pre>
+TABLE: OPERACOES
+PK:
+idOperacao STRING
+Attributes:
+produto STRING
+tipoOperacao STRING
+clearingDestino STRING
+chaveIdempotencia STRING
+versaoModelo NUMBER
+origem MAP
+dataHoraInclusao STRING
+dataHoraAlteracao STRING
+dadosOperacao MAP
+</pre>
+<h2>REGISTROS_CLEARING</h2>
+<pre>
+TABLE: REGISTROS_CLEARING
+PK:
+idOperacao STRING
+Attributes:
+idRegistro STRING
+clearing STRING
+status STRING
+idExterno STRING
+tentativa NUMBER
+versaoModelo NUMBER
+dataHoraInclusao STRING
+dataHoraAlteracao STRING
+dadosRegistro MAP
+</pre>
+<h2>EVENTOS_REGISTRO</h2>
+<pre>
+TABLE: EVENTOS_REGISTRO
+PK:
+idOperacao STRING
+SK:
+chaveEvento STRING
+Attributes:
+idEvento STRING
+idRegistro STRING
+tipoEvento STRING
+statusAnterior STRING
+statusAtual STRING
+origemEvento STRING
+dataHoraEvento STRING
+versaoModelo NUMBER
+dadosEvento MAP
+</pre>
+<h1>48. Infraestrutura</h1>
+<p>
+A configuração definitiva deverá ser criada utilizando Terraform.
+</p>
+<p>O código deverá contemplar:</p>
+<ul>
+    <li>criação das três tabelas;</li>
+    <li>Partition Keys;</li>
+    <li>Sort Key de EVENTOS_REGISTRO;</li>
+    <li>INDICE_ID_EXTERNO;</li>
+    <li>INDICE_IDEMPOTENCIA, caso aprovado;</li>
+    <li>modo de capacidade definido pelo projeto;</li>
+    <li>DynamoDB Stream de OPERACOES;</li>
+    <li>criptografia conforme padrão corporativo;</li>
+    <li>tags corporativas;</li>
+    <li>configurações de backup/PITR conforme padrão corporativo;</li>
+    <li>IAM seguindo menor privilégio.</li>
+</ul>
+<h1>49. Requisitos</h1>
+<ol>
+<li>
+<strong>RF01.</strong>
+Criar a tabela <code>OPERACOES</code>.
+</li>
+<li>
+<strong>RF02.</strong>
+<code>OPERACOES</code> deverá utilizar
+<code>idOperacao</code> como Partition Key.
+</li>
+<li>
+<strong>RF03.</strong>
+<code>OPERACOES</code> não deverá possuir Sort Key inicialmente.
+</li>
+<li>
+<strong>RF04.</strong>
+Criar a tabela <code>REGISTROS_CLEARING</code>.
+</li>
+<li>
+<strong>RF05.</strong>
+<code>REGISTROS_CLEARING</code> deverá utilizar
+<code>idOperacao</code> como Partition Key.
+</li>
+<li>
+<strong>RF06.</strong>
+<code>REGISTROS_CLEARING</code> não deverá possuir Sort Key inicialmente.
+</li>
+<li>
+<strong>RF07.</strong>
+Criar a tabela <code>EVENTOS_REGISTRO</code>.
+</li>
+<li>
+<strong>RF08.</strong>
+<code>EVENTOS_REGISTRO</code> deverá utilizar
+<code>idOperacao</code> como Partition Key.
+</li>
+<li>
+<strong>RF09.</strong>
+<code>EVENTOS_REGISTRO</code> deverá utilizar
+<code>chaveEvento</code> como Sort Key.
+</li>
+<li>
+<strong>RF10.</strong>
+Criar <code>INDICE_ID_EXTERNO</code>.
+</li>
+<li>
+<strong>RF11.</strong>
+Avaliar a criação de <code>INDICE_IDEMPOTENCIA</code>.
+</li>
+<li>
+<strong>RF12.</strong>
+Cada tabela deverá possuir um envelope canônico estável.
+</li>
+<li>
+<strong>RF13.</strong>
+Dados específicos da operação deverão ser armazenados em
+<code>dadosOperacao</code>.
+</li>
+<li>
+<strong>RF14.</strong>
+Dados específicos do processo de registro deverão ser armazenados em
+<code>dadosRegistro</code>.
+</li>
+<li>
+<strong>RF15.</strong>
+Dados específicos dos eventos deverão ser armazenados em
+<code>dadosEvento</code>.
+</li>
+<li>
+<strong>RF16.</strong>
+O modelo não deverá ser acoplado ao contrato CSV.
+</li>
+<li>
+<strong>RF17.</strong>
+O modelo não deverá ser acoplado ao contrato Kafka.
+</li>
+<li>
+<strong>RF18.</strong>
+O modelo não deverá ser acoplado ao contrato B3 ou de outra clearing.
+</li>
+<li>
+<strong>RF19.</strong>
+Cada item deverá possuir <code>versaoModelo</code>.
+</li>
+<li>
+<strong>RF20.</strong>
+Os contratos versionados deverão ser validados pela aplicação.
+</li>
+<li>
+<strong>RF21.</strong>
+<code>EVENTOS_REGISTRO</code> deverá ser append-only.
+</li>
+<li>
+<strong>RF22.</strong>
+Cada operação deverá possuir exatamente uma clearing de destino.
+</li>
+<li>
+<strong>RF23.</strong>
+Mudanças de estado e histórico deverão permanecer consistentes.
+</li>
+<li>
+<strong>RF24.</strong>
+Somente <code>OPERACOES</code> deverá iniciar o fluxo através
+do DynamoDB Stream nesta etapa.
+</li>
+<li>
+<strong>RF25.</strong>
+A infraestrutura oficial deverá ser provisionada através de Terraform.
+</li>
+</ol>
+<h1>50. Critérios de aceite</h1>
+<ol>
+<li>
+<strong>CA01.</strong>
+As três tabelas deverão ser criadas com as PK/SK especificadas.
+</li>
+<li>
+<strong>CA02.</strong>
+Uma operação deverá ser recuperável diretamente por
+<code>idOperacao</code>.
+</li>
+<li>
+<strong>CA03.</strong>
+O estado atual do registro deverá ser recuperável diretamente
+por <code>idOperacao</code>.
+</li>
+<li>
+<strong>CA04.</strong>
+O histórico deverá ser consultável por
+<code>idOperacao</code>.
+</li>
+<li>
+<strong>CA05.</strong>
+Os eventos deverão ser retornados cronologicamente.
+</li>
+<li>
+<strong>CA06.</strong>
+O último evento deverá ser recuperável sem Scan completo.
+</li>
+<li>
+<strong>CA07.</strong>
+O retorno externo deverá localizar o registro através de
+<code>idExterno</code>.
+</li>
+<li>
+<strong>CA08.</strong>
+RDB e CDB deverão coexistir sem alteração estrutural das tabelas.
+</li>
+<li>
+<strong>CA09.</strong>
+Um novo produto deverá poder introduzir novos atributos dentro
+de <code>dadosOperacao</code>.
+</li>
+<li>
+<strong>CA10.</strong>
+Uma nova clearing deverá poder introduzir dados específicos
+sem alterar desnecessariamente o envelope canônico.
+</li>
+<li>
+<strong>CA11.</strong>
+Eventos diferentes deverão suportar estruturas distintas
+dentro de <code>dadosEvento</code>.
+</li>
+<li>
+<strong>CA12.</strong>
+Os adapters de entrada deverão produzir o mesmo modelo canônico,
+independentemente da origem.
+</li>
+<li>
+<strong>CA13.</strong>
+O modelo deverá possuir versionamento explícito.
+</li>
+<li>
+<strong>CA14.</strong>
+O histórico deverá permanecer append-only.
+</li>
+<li>
+<strong>CA15.</strong>
+Snapshot e histórico deverão permanecer consistentes.
+</li>
+<li>
+<strong>CA16.</strong>
+A POC deverá validar <code>TransactWriteItems</code>.
+</li>
+<li>
+<strong>CA17.</strong>
+A POC deverá validar <code>INDICE_ID_EXTERNO</code>.
+</li>
+<li>
+<strong>CA18.</strong>
+A estratégia de idempotência deverá ser validada antes
+da implementação definitiva.
+</li>
+<li>
+<strong>CA19.</strong>
+Somente inserções elegíveis em <code>OPERACOES</code> deverão
+iniciar o fluxo de registro.
+</li>
+<li>
+<strong>CA20.</strong>
+A configuração definitiva deverá estar representada em Terraform.
+</li>
+</ol>
+<h1>51. Resultado arquitetural esperado</h1>
+<pre>
+                   ENTRADAS
+              CSV          Kafka
+               │             │
+               ▼             ▼
+          CSV Adapter   Kafka Adapter
+               │             │
+               └──────┬──────┘
+                      │
+                      ▼
+               MODELO CANÔNICO
+                      │
+                      ▼
+                  OPERACOES
+                      │
+                      │ 1 : 1
+                      ▼
+             REGISTROS_CLEARING
+                      │
+                      │ 1 : N
+                      ▼
+              EVENTOS_REGISTRO
+</pre>
+<p>Estrutura dos dados:</p>
+<pre>
+OPERACOES
+└── dadosOperacao { }
+REGISTROS_CLEARING
+└── dadosRegistro { }
+EVENTOS_REGISTRO
+└── dadosEvento { }
+</pre>
+<p>Na saída:</p>
+<pre>
+MODELO CANÔNICO
+       │
+       ▼
+Clearing Router
+       │
+   ┌───┴──────────────────┐
+   │                      │
+   ▼                      ▼
+Adapter B3         Adapter Clearing X
+   │                      │
+   ▼                      ▼
+  B3                  Clearing X
+</pre>
+<div class="success">
+<strong>Resultado esperado:</strong>
+
+O DynamoDB permanecerá flexível fisicamente, enquanto o domínio
+permanecerá controlado através de envelopes canônicos,
+contratos versionados, adapters e validação na aplicação.
+
+</div>
+</body>
+</html>
