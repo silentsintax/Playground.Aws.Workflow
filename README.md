@@ -1262,4 +1262,909 @@ identificadorExterno
 identificadorRegistro
         │
         └── "A qual registro/operação ela corresponde?"
+
+
+
+
+Título
+
+Criar estrutura DynamoDB para operações, registros e histórico de clearing
+
+Objetivo
+
+Criar a estrutura de persistência DynamoDB da plataforma de registro em clearing utilizando três tabelas:
+
+1. OPERACOES
+2. REGISTROS_CLEARING
+3. EVENTOS_REGISTRO
+
+A modelagem deverá suportar:
+
+* alta volumetria;
+* múltiplos produtos;
+* múltiplas clearings;
+* uma única clearing por operação;
+* diferentes origens de entrada, inicialmente CSV e futuramente Kafka;
+* idempotência;
+* correlação com sistemas externos;
+* rastreabilidade;
+* evolução dos contratos;
+* inclusão de novos produtos sem necessidade de alteração frequente da estrutura física;
+* inclusão de novas clearings sem acoplamento do modelo interno aos seus contratos.
+
+A infraestrutura oficial deverá ser criada através de Terraform.
+
+Antes da implementação definitiva, a estrutura poderá ser criada manualmente no AWS Console para realização da POC.
+
+⸻
+
+1. Princípio da modelagem
+
+Embora o DynamoDB não imponha schema sobre todos os atributos dos itens, a aplicação deverá possuir um modelo canônico explicitamente definido e versionado.
+
+A ausência de schema físico no DynamoDB não deverá significar ausência de contrato de domínio.
+
+A estrutura seguirá o princípio:
+
+          ITEM DYNAMODB
+                │
+       ┌────────┴────────┐
+       │                 │
+       ▼                 ▼
+ENVELOPE CANÔNICO    DADOS FLEXÍVEIS
+       │                 │
+       │                 ├── dadosOperacao
+       │                 ├── dadosRegistro
+       │                 └── dadosEvento
+       │
+       ├── identidade
+       ├── roteamento
+       ├── correlação
+       ├── idempotência
+       ├── controle
+       ├── auditoria
+       └── versão
+
+Regra de decisão
+
+Um atributo deverá permanecer no primeiro nível quando for necessário para pelo menos uma das seguintes finalidades:
+
+* PK;
+* SK;
+* GSI;
+* identificação;
+* correlação;
+* roteamento;
+* idempotência;
+* controle do workflow;
+* versionamento;
+* auditoria.
+
+Dados específicos do negócio, produto, clearing ou evento deverão preferencialmente ficar dentro do Map correspondente.
+
+⸻
+
+2. Independência das origens e destinos
+
+O modelo persistido não deverá representar diretamente o contrato do CSV, Kafka, B3, Pismo ou qualquer outra integração.
+
+Entradas deverão ser adaptadas:
+
+CSV
+ │
+ ▼
+Adapter CSV
+ │
+ │
+ ├─────────────┐
+               ▼
+        MODELO CANÔNICO
+               ▲
+               │
+ ├─────────────┘
+ │
+Adapter Kafka
+ ▲
+ │
+Kafka
+
+Da mesma forma, os contratos externos das clearings deverão ser produzidos a partir do modelo canônico:
+
+             MODELO CANÔNICO
+                    │
+                    ▼
+             Clearing Router
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+      Adapter B3 Adapter X Adapter Y
+          │         │         │
+          ▼         ▼         ▼
+          B3    Clearing X Clearing Y
+
+Portanto:
+
+A estrutura DynamoDB pertence ao domínio da plataforma de clearing e não às interfaces de entrada ou saída.
+
+⸻
+
+3. Visão geral das tabelas
+
+                    OPERACOES
+                       │
+                       │ 1 : 1
+                       ▼
+              REGISTROS_CLEARING
+                       │
+                       │ 1 : N
+                       ▼
+                EVENTOS_REGISTRO
+
+Responsabilidades:
+
+OPERACOES
+→ dado canônico da operação
+REGISTROS_CLEARING
+→ estado operacional atual
+EVENTOS_REGISTRO
+→ histórico append-only
+
+⸻
+
+4. Tabela OPERACOES
+
+Finalidade
+
+Representar uma operação financeira recebida pela plataforma.
+
+Uma operação deverá possuir exatamente uma clearing de destino.
+
+Chaves
+
+PK = idOperacao
+SK = não possui
+
+A ausência de SK é intencional.
+
+Existe exatamente um item de operação para cada idOperacao.
+
+Adicionar uma SK constante não acrescentaria nenhum novo padrão de acesso.
+
+⸻
+
+5. Estrutura de OPERACOES
+
+Campo	Tipo	Obrigatório	Finalidade
+idOperacao	String	Sim	PK / identificador interno
+produto	String	Sim	RDB, CDB etc.
+tipoOperacao	String	Sim	APLICACAO / RESGATE
+clearingDestino	String	Sim	Clearing responsável pelo registro
+chaveIdempotencia	String	Sim	Identidade lógica da operação
+versaoModelo	Number	Sim	Versão do contrato canônico
+origem	Map	Sim	Informações da origem
+dataHoraInclusao	String	Sim	Auditoria
+dataHoraAlteracao	String	Sim	Auditoria
+dadosOperacao	Map	Sim	Payload específico da operação
+
+Estrutura:
+
+OPERACOES
+│
+├── idOperacao                PK
+├── produto
+├── tipoOperacao
+├── clearingDestino
+├── chaveIdempotencia
+├── versaoModelo
+├── origem
+│   ├── tipo
+│   └── identificador
+├── dataHoraInclusao
+├── dataHoraAlteracao
+│
+└── dadosOperacao
+      └── Map flexível
+
+⸻
+
+6. dadosOperacao
+
+dadosOperacao deverá armazenar informações específicas do negócio da operação.
+
+Exemplos:
+
+* valor;
+* data da operação;
+* vencimento;
+* taxa;
+* indexador;
+* código do instrumento;
+* dados específicos do RDB;
+* dados específicos do CDB;
+* futuros campos necessários para novos produtos.
+
+Exemplo RDB:
+
+{
+  "idOperacao": "OP-000001",
+  "produto": "RDB",
+  "tipoOperacao": "APLICACAO",
+  "clearingDestino": "B3",
+  "chaveIdempotencia": "ARQUIVO#20261005#000001",
+  "versaoModelo": 1,
+  "origem": {
+    "tipo": "ARQUIVO",
+    "identificador": "ARQ-000001"
+  },
+  "dataHoraInclusao": "2026-10-05T10:00:00.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:00:00.000Z",
+  "dadosOperacao": {
+    "valor": 15000.50,
+    "dataOperacao": "2026-10-05",
+    "codigoRdb": "RDB001",
+    "dataVencimento": "2028-10-05",
+    "taxa": 0.125
+  }
+}
+
+Exemplo CDB:
+
+{
+  "idOperacao": "OP-000003",
+  "produto": "CDB",
+  "tipoOperacao": "APLICACAO",
+  "clearingDestino": "B3",
+  "chaveIdempotencia": "ARQUIVO#20261005#000003",
+  "versaoModelo": 1,
+  "origem": {
+    "tipo": "ARQUIVO",
+    "identificador": "ARQ-000003"
+  },
+  "dataHoraInclusao": "2026-10-05T10:02:00.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:02:00.000Z",
+  "dadosOperacao": {
+    "valor": 25000.00,
+    "dataOperacao": "2026-10-05",
+    "codigoCdb": "CDB001",
+    "indexador": "CDI",
+    "percentualIndexador": 105,
+    "dataVencimento": "2029-10-05"
+  }
+}
+
+⸻
+
+7. Versionamento do modelo
+
+O campo:
+
+versaoModelo
+
+deverá identificar a versão do contrato canônico.
+
+Exemplo:
+
+produto = RDB
+versaoModelo = 1
+
+poderá utilizar:
+
+ValidadorRdbV1
+
+No futuro:
+
+produto = RDB
+versaoModelo = 2
+
+poderá utilizar:
+
+ValidadorRdbV2
+
+Isso permitirá evolução controlada do contrato sem reinterpretar silenciosamente dados históricos.
+
+⸻
+
+8. Idempotência
+
+A tabela OPERACOES deverá possuir:
+
+chaveIdempotencia
+
+Exemplo para arquivo:
+
+ARQUIVO#20261005#000001
+
+Exemplo futuro para Kafka:
+
+KAFKA#TOPICO-OPERACOES#12#987654
+
+Poderá ser avaliado o GSI:
+
+INDICE_IDEMPOTENCIA
+PK = chaveIdempotencia
+
+Entretanto:
+
+GSI não deverá ser considerado sozinho como mecanismo de garantia de unicidade.
+
+A estratégia definitiva deverá considerar concorrência e escrita condicional e/ou estrutura específica para controle de idempotência.
+
+⸻
+
+9. Tabela REGISTROS_CLEARING
+
+Finalidade
+
+Representar o estado operacional atual do registro da operação na clearing.
+
+Como cada operação possui exatamente uma clearing:
+
+OPERACAO 1 ───────── 1 REGISTRO_CLEARING
+
+Chaves
+
+PK = idOperacao
+SK = não possui
+
+A ausência de SK também é intencional.
+
+A própria estrutura física reforça a regra:
+
+uma operação
+      ↓
+um registro atual
+
+⸻
+
+10. Estrutura de REGISTROS_CLEARING
+
+Campo	Tipo	Obrigatório	Finalidade
+idOperacao	String	Sim	PK
+idRegistro	String	Sim	Identificador interno
+clearing	String	Sim	Clearing utilizada
+status	String	Sim	Estado operacional atual
+idExterno	String	Não	Correlação externa
+tentativa	Number	Sim	Tentativa atual
+versaoModelo	Number	Sim	Versão do contrato
+dataHoraInclusao	String	Sim	Auditoria
+dataHoraAlteracao	String	Sim	Auditoria
+dadosRegistro	Map	Não	Dados variáveis do registro
+
+Estrutura:
+
+REGISTROS_CLEARING
+│
+├── idOperacao             PK
+├── idRegistro
+├── clearing
+├── status
+├── idExterno
+├── tentativa
+├── versaoModelo
+├── dataHoraInclusao
+├── dataHoraAlteracao
+│
+└── dadosRegistro
+      └── Map flexível
+
+⸻
+
+11. dadosRegistro
+
+Informações específicas da clearing ou do processamento que não sejam necessárias como atributos estruturais deverão ficar em:
+
+dadosRegistro
+
+Exemplo:
+
+{
+  "idOperacao": "OP-000001",
+  "idRegistro": "REG-000001",
+  "clearing": "B3",
+  "status": "REGISTRADO",
+  "idExterno": "B3-20261005-000001",
+  "tentativa": 1,
+  "versaoModelo": 1,
+  "dataHoraInclusao": "2026-10-05T10:00:10.000Z",
+  "dataHoraAlteracao": "2026-10-05T10:05:00.000Z",
+  "dadosRegistro": {
+    "protocolo": "PROTOCOLO-B3-001",
+    "codigoRetorno": "00",
+    "mensagemRetorno": "Registro realizado com sucesso"
+  }
+}
+
+O campo idExterno deverá permanecer no primeiro nível porque será utilizado para correlação e consulta através de GSI.
+
+⸻
+
+12. GSI de correlação externa
+
+Criar:
+
+INDICE_ID_EXTERNO
+
+com:
+
+PK = idExterno
+
+Fluxo:
+
+Pismo
+  │
+  │ retorno
+  ▼
+SNS
+  │
+  ▼
+SQS RETORNO
+  │
+  ▼
+Return Worker
+  │
+  │ idExterno
+  ▼
+INDICE_ID_EXTERNO
+  │
+  ▼
+idOperacao
+
+⸻
+
+13. Tabela EVENTOS_REGISTRO
+
+Finalidade
+
+Armazenar a timeline append-only do processo de registro.
+
+Uma operação poderá possuir N eventos:
+
+OP-000001
+   │
+   ├── REGISTRO_CRIADO
+   ├── ENVIO_INICIADO
+   ├── ENVIADO_CLEARING
+   └── REGISTRADO
+
+Chaves
+
+PK = idOperacao
+SK = chaveEvento
+
+Formato:
+
+<dataHoraEvento>#<idEvento>
+
+Exemplo:
+
+2026-10-05T10:00:10.000Z#EVT-001
+2026-10-05T10:01:00.000Z#EVT-002
+2026-10-05T10:02:00.000Z#EVT-003
+2026-10-05T10:05:00.000Z#EVT-004
+
+⸻
+
+14. Estrutura de EVENTOS_REGISTRO
+
+Campo	Tipo	Obrigatório	Finalidade
+idOperacao	String	Sim	PK
+chaveEvento	String	Sim	SK
+idEvento	String	Sim	Identificador do evento
+idRegistro	String	Sim	Correlação com registro
+tipoEvento	String	Sim	Tipo
+statusAnterior	String	Não	Estado anterior
+statusAtual	String	Não	Novo estado
+origemEvento	String	Sim	Origem
+dataHoraEvento	String	Sim	Data/hora
+versaoModelo	Number	Sim	Versão
+dadosEvento	Map	Não	Payload variável
+
+Estrutura:
+
+EVENTOS_REGISTRO
+│
+├── idOperacao             PK
+├── chaveEvento            SK
+├── idEvento
+├── idRegistro
+├── tipoEvento
+├── statusAnterior
+├── statusAtual
+├── origemEvento
+├── dataHoraEvento
+├── versaoModelo
+│
+└── dadosEvento
+      └── Map flexível
+
+⸻
+
+15. Exemplo de evento de sucesso
+
+{
+  "idOperacao": "OP-000001",
+  "chaveEvento": "2026-10-05T10:05:00.000Z#EVT-004",
+  "idEvento": "EVT-004",
+  "idRegistro": "REG-000001",
+  "tipoEvento": "STATUS_ALTERADO",
+  "statusAnterior": "ENVIADO",
+  "statusAtual": "REGISTRADO",
+  "origemEvento": "RETORNO_PISMO",
+  "dataHoraEvento": "2026-10-05T10:05:00.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {
+    "idExterno": "B3-20261005-000001",
+    "protocolo": "PROTOCOLO-B3-001",
+    "codigoRetorno": "00",
+    "mensagem": "Registro realizado com sucesso"
+  }
+}
+
+⸻
+
+16. Exemplo de evento de erro
+
+{
+  "idOperacao": "OP-000003",
+  "chaveEvento": "2026-10-05T10:07:00.000Z#EVT-010",
+  "idEvento": "EVT-010",
+  "idRegistro": "REG-000003",
+  "tipoEvento": "ERRO_REGISTRO",
+  "statusAnterior": "EM_PROCESSAMENTO",
+  "statusAtual": "ERRO",
+  "origemEvento": "ADAPTER_B3",
+  "dataHoraEvento": "2026-10-05T10:07:00.000Z",
+  "versaoModelo": 1,
+  "dadosEvento": {
+    "codigoErro": "B3-001",
+    "descricao": "Instrumento não encontrado",
+    "tentativa": 2,
+    "reprocessavel": true
+  }
+}
+
+⸻
+
+17. Resumo das chaves
+
+Tabela	PK	SK
+OPERACOES	idOperacao	—
+REGISTROS_CLEARING	idOperacao	—
+EVENTOS_REGISTRO	idOperacao	chaveEvento
+
+GSIs:
+
+Tabela	Índice	PK
+OPERACOES	INDICE_IDEMPOTENCIA*	chaveIdempotencia
+REGISTROS_CLEARING	INDICE_ID_EXTERNO	idExterno
+EVENTOS_REGISTRO	Nenhum inicialmente	—
+
+* INDICE_IDEMPOTENCIA deverá ser validado junto à estratégia definitiva de idempotência.
+
+⸻
+
+18. Atomicidade
+
+Alterações que representem uma única transição lógica deverão manter o snapshot e histórico consistentes.
+
+Exemplo:
+
+ENVIADO
+   │
+   ▼
+REGISTRADO
+
+Deverá resultar em:
+
+TransactWriteItems
+       │
+       ├── UPDATE REGISTROS_CLEARING
+       │      status = REGISTRADO
+       │
+       └── PUT EVENTOS_REGISTRO
+              ENVIADO → REGISTRADO
+
+Deve ocorrer:
+
+TUDO
+ OU
+NADA
+
+⸻
+
+19. DynamoDB Streams
+
+Somente:
+
+OPERACOES
+
+deverá possuir o Stream utilizado para iniciar o fluxo de registro:
+
+OPERACOES
+    │
+    ▼
+DynamoDB Streams
+    │
+    ▼
+EventBridge Pipes
+    │
+    ▼
+SQS REGISTRO
+
+Alterações em:
+
+REGISTROS_CLEARING
+EVENTOS_REGISTRO
+
+não deverão iniciar novo envio para clearing.
+
+⸻
+
+20. Configuração manual para POC
+
+OPERACOES
+
+Configuração	Valor
+Table name	OPERACOES
+Partition key	idOperacao
+Partition key type	String
+Sort key	Não
+Capacity	On-demand
+Stream	Habilitado para POC
+GSI opcional	INDICE_IDEMPOTENCIA
+GSI PK	chaveIdempotencia
+
+REGISTROS_CLEARING
+
+Configuração	Valor
+Table name	REGISTROS_CLEARING
+Partition key	idOperacao
+Partition key type	String
+Sort key	Não
+Capacity	On-demand
+GSI	INDICE_ID_EXTERNO
+GSI PK	idExterno
+
+EVENTOS_REGISTRO
+
+Configuração	Valor
+Table name	EVENTOS_REGISTRO
+Partition key	idOperacao
+Partition key type	String
+Sort key	chaveEvento
+Sort key type	String
+Capacity	On-demand
+Stream	Não
+GSI	Nenhum inicialmente
+
+⸻
+
+21. Massa da POC
+
+A POC deverá possuir ao menos:
+
+OP-000001 | RDB | APLICACAO | B3 | REGISTRADO
+OP-000002 | RDB | RESGATE   | B3 | EM_PROCESSAMENTO
+OP-000003 | CDB | APLICACAO | B3 | ERRO
+OP-000004 | RDB | APLICACAO | B3 | PENDENTE
+
+Os itens deverão seguir o novo modelo de envelope + Maps descrito nesta história.
+
+⸻
+
+22. Consultas da POC
+
+Consultar operação
+
+Tabela: OPERACOES
+GetItem
+idOperacao = OP-000001
+
+Consultar estado atual
+
+Tabela: REGISTROS_CLEARING
+GetItem
+idOperacao = OP-000001
+
+Consultar histórico
+
+Tabela: EVENTOS_REGISTRO
+Query
+idOperacao = OP-000001
+
+Consultar último evento
+
+idOperacao = OP-000001
+ScanIndexForward = false
+Limit = 1
+
+Localizar pelo retorno externo
+
+Tabela: REGISTROS_CLEARING
+Índice: INDICE_ID_EXTERNO
+idExterno = B3-20261005-000001
+
+⸻
+
+23. Consultas analíticas
+
+Não deverão ser criados GSIs indiscriminadamente para consultas como:
+
+* total de RDB;
+* total de CDB;
+* operações B3;
+* operações registradas;
+* operações com erro;
+* operações pendentes;
+* dashboard por período.
+
+Esses padrões deverão ser avaliados futuramente através de read model, exportação/ETL, S3/Athena ou solução equivalente.
+
+O DynamoDB atual deverá ser otimizado principalmente para o processamento transacional.
+
+⸻
+
+24. Volumetria
+
+Considerando conceitualmente 20 milhões de operações:
+
+OPERACOES
+≈ 20 milhões de itens
+REGISTROS_CLEARING
+≈ 20 milhões de itens + atualizações
+EVENTOS_REGISTRO
+≈ 20 milhões × quantidade média de eventos
+
+Com cinco eventos por operação:
+
+20 milhões × 5
+=
+100 milhões de eventos
+
+O exemplo é apenas ilustrativo para demonstrar a diferença de crescimento entre as tabelas.
+
+As PKs não deverão utilizar valores de baixa cardinalidade como:
+
+B3
+RDB
+REGISTRADO
+
+idOperacao deverá fornecer distribuição adequada das partições.
+
+⸻
+
+25. Requisitos
+
+RF01. Criar OPERACOES.
+
+RF02. OPERACOES deverá utilizar idOperacao como PK e não possuir SK inicialmente.
+
+RF03. Criar REGISTROS_CLEARING.
+
+RF04. REGISTROS_CLEARING deverá utilizar idOperacao como PK e não possuir SK inicialmente.
+
+RF05. Criar EVENTOS_REGISTRO.
+
+RF06. EVENTOS_REGISTRO deverá utilizar idOperacao como PK e chaveEvento como SK.
+
+RF07. Criar INDICE_ID_EXTERNO.
+
+RF08. Avaliar INDICE_IDEMPOTENCIA.
+
+RF09. Cada tabela deverá possuir envelope canônico estável.
+
+RF10. Dados específicos deverão ser armazenados nos Maps dadosOperacao, dadosRegistro e dadosEvento.
+
+RF11. O modelo não deverá ser acoplado ao contrato CSV.
+
+RF12. O modelo não deverá ser acoplado ao contrato Kafka.
+
+RF13. O modelo não deverá ser acoplado ao contrato B3.
+
+RF14. Cada item deverá possuir versaoModelo.
+
+RF15. Os contratos versionados deverão ser validados pela aplicação.
+
+RF16. EVENTOS_REGISTRO deverá ser append-only.
+
+RF17. Cada operação deverá possuir exatamente uma clearing.
+
+RF18. Mudanças de estado e histórico deverão permanecer consistentes.
+
+RF19. Somente OPERACOES deverá iniciar o fluxo através do Stream.
+
+RF20. A infraestrutura oficial deverá ser provisionada através de Terraform.
+
+⸻
+
+26. Critérios de aceite
+
+CA01. As três tabelas deverão ser criadas com as PK/SK especificadas.
+
+CA02. Uma operação deverá ser recuperável diretamente por idOperacao.
+
+CA03. Seu estado atual deverá ser recuperável diretamente por idOperacao.
+
+CA04. Seu histórico deverá ser consultável por idOperacao.
+
+CA05. Eventos deverão ser retornados cronologicamente.
+
+CA06. O último evento deverá ser recuperável sem Scan completo.
+
+CA07. O retorno Pismo deverá localizar o registro através de idExterno.
+
+CA08. RDB e CDB deverão coexistir sem alteração estrutural da tabela.
+
+CA09. Um novo produto deverá poder introduzir novos atributos dentro de dadosOperacao.
+
+CA10. Uma nova clearing deverá poder introduzir dados específicos sem alterar o envelope canônico desnecessariamente.
+
+CA11. Eventos diferentes deverão suportar estruturas distintas dentro de dadosEvento.
+
+CA12. Os adapters de entrada deverão produzir o mesmo modelo canônico independentemente da origem.
+
+CA13. O modelo deverá possuir versionamento explícito.
+
+CA14. Histórico deverá permanecer append-only.
+
+CA15. Snapshot e histórico deverão permanecer consistentes.
+
+CA16. A POC deverá validar TransactWriteItems.
+
+CA17. A POC deverá validar INDICE_ID_EXTERNO.
+
+CA18. A estratégia de idempotência deverá ser validada antes da implementação definitiva.
+
+CA19. Somente inserções elegíveis em OPERACOES deverão iniciar o fluxo de registro.
+
+CA20. A configuração definitiva deverá estar representada em Terraform.
+
+⸻
+
+27. Resultado arquitetural esperado
+
+A estrutura final deverá seguir:
+
+                   ENTRADAS
+              CSV          Kafka
+               │             │
+               ▼             ▼
+          CSV Adapter   Kafka Adapter
+               │             │
+               └──────┬──────┘
+                      ▼
+               MODELO CANÔNICO
+                      │
+                      ▼
+                  OPERACOES
+                      │
+                      ▼
+             REGISTROS_CLEARING
+                      │
+                      ▼
+              EVENTOS_REGISTRO
+OPERACOES
+└── dadosOperacao { }
+REGISTROS_CLEARING
+└── dadosRegistro { }
+EVENTOS_REGISTRO
+└── dadosEvento { }
+
+Na saída:
+
+MODELO CANÔNICO
+       │
+       ▼
+Clearing Router
+       │
+   ┌───┴───────────────┐
+   ▼                   ▼
+Adapter B3        Adapter Clearing X
+   │                   │
+   ▼                   ▼
+  B3               Clearing X
+
+O DynamoDB permanecerá flexível fisicamente, enquanto o domínio permanecerá controlado através de envelopes canônicos, contratos versionados, adapters e validação na aplicação.
+
+
 ```
