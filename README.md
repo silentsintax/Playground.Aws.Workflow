@@ -5274,3 +5274,1256 @@ contratos versionados, adapters e validação na aplicação.
 </div>
 </body>
 </html>
+
+
+TÍTULO
+
+Criar estrutura DynamoDB para armazenamento de operações, registros em clearing e histórico de eventos
+
+DESCRIÇÃO
+
+Esta história tem como objetivo criar a estrutura de persistência em DynamoDB utilizada pela plataforma de registro de operações em múltiplas clearings.
+
+A solução deverá ser preparada para alta volumetria e evolução do negócio, considerando que inicialmente serão processadas operações de RDB e, posteriormente, outros produtos, como CDB e novos produtos que venham a ser registrados pela plataforma.
+
+Embora a plataforma suporte múltiplas clearings, cada operação individual será destinada a apenas uma clearing.
+
+A modelagem não deverá ser baseada no formato das fontes de entrada. Inicialmente teremos operações provenientes de arquivos CSV e futuramente operações provenientes de Kafka, porém CSV e Kafka são apenas contratos externos de entrada.
+
+Cada origem deverá possuir seu próprio parser/adapter responsável por transformar os dados recebidos no modelo canônico definido pela plataforma.
+
+Da mesma forma, a estrutura não deverá ser modelada de acordo com o contrato de uma clearing específica, como B3. A comunicação com cada clearing deverá ser responsabilidade dos respectivos adapters de saída.
+
+A persistência deverá ser dividida em três tabelas:
+
+OPERACOES
+
+REGISTROS_CLEARING
+
+EVENTOS_REGISTRO
+
+A separação das tabelas tem como objetivo permitir que cada conjunto de informações possua estratégia própria de armazenamento, acesso, crescimento, índices e capacidade.
+
+As tabelas possuem responsabilidades diferentes.
+
+OPERACOES representa o fato financeiro recebido pela plataforma.
+
+REGISTROS_CLEARING representa o estado operacional atual do processo de registro da operação na clearing.
+
+EVENTOS_REGISTRO representa o histórico cronológico das mudanças ocorridas durante o processo de registro.
+
+MODELO CANÔNICO
+
+Apesar de o DynamoDB não possuir schema rígido para todos os atributos de um item, a aplicação deverá possuir um modelo canônico bem definido.
+
+O fato de o DynamoDB ser schema-less não significa que os itens possam possuir estruturas arbitrárias sem controle.
+
+Cada tabela deverá possuir um conjunto de atributos canônicos no primeiro nível do documento.
+
+Devem permanecer no primeiro nível principalmente os atributos necessários para:
+
+Identificação
+
+Partition Key
+
+Sort Key
+
+Global Secondary Index
+
+Idempotência
+
+Correlação
+
+Roteamento
+
+Controle do workflow
+
+Versionamento
+
+Auditoria
+
+Os dados específicos de cada produto, clearing ou evento deverão ser armazenados em objetos flexíveis.
+
+Para OPERACOES será utilizado o objeto dadosOperacao.
+
+Para REGISTROS_CLEARING será utilizado o objeto dadosRegistro.
+
+Para EVENTOS_REGISTRO será utilizado o objeto dadosEvento.
+
+Dessa forma, a inclusão de novos produtos ou novos campos não deverá exigir necessariamente alteração estrutural das tabelas.
+
+TABELA OPERACOES
+
+Finalidade:
+
+Armazenar a representação canônica da operação financeira recebida pela plataforma.
+
+Cada operação deverá possuir exatamente uma clearing de destino.
+
+Partition Key:
+
+idOperacao
+
+Tipo:
+
+String
+
+Sort Key:
+
+Não possui.
+
+A ausência de Sort Key é intencional.
+
+Existe somente um item representando cada operação financeira. Portanto, idOperacao identifica completamente o item e não existe atualmente um segundo padrão de ordenação que justifique uma Sort Key.
+
+Adicionar uma Sort Key constante apenas aumentaria a complexidade sem fornecer benefício para os padrões de acesso conhecidos.
+
+ATRIBUTOS PRINCIPAIS DE OPERACOES
+
+idOperacao
+
+Tipo: String
+
+Finalidade: Partition Key e identificador interno único da operação.
+
+Sugestão de geração: UUID/GUID.
+
+produto
+
+Tipo: String
+
+Finalidade: identificar o produto financeiro da operação.
+
+Exemplos:
+
+RDB
+
+CDB
+
+tipoOperacao
+
+Tipo: String
+
+Finalidade: identificar a natureza da operação.
+
+Exemplos:
+
+APLICACAO
+
+RESGATE
+
+clearingDestino
+
+Tipo: String
+
+Finalidade: identificar para qual clearing a operação deverá ser enviada.
+
+Cada operação possuirá somente uma clearing de destino.
+
+chaveIdempotencia
+
+Tipo: String
+
+Finalidade: representar a identidade lógica da operação para auxiliar na prevenção de processamento duplicado.
+
+Exemplo para arquivo:
+
+ARQUIVO#20261006#000001
+
+No futuro, para Kafka, a composição poderá utilizar informações próprias da mensagem, desde que a estratégia definida garanta uma identidade estável para a mesma operação.
+
+versaoModelo
+
+Tipo: Number
+
+Finalidade: identificar a versão do contrato canônico utilizado pelo item.
+
+Exemplo:
+
+1
+
+origem
+
+Tipo: Map
+
+Finalidade: identificar de onde a operação foi recebida.
+
+Exemplo conceitual:
+
+tipo = ARQUIVO
+
+identificador = ARQ-000001
+
+dataHoraInclusao
+
+Tipo: String
+
+Formato recomendado: ISO-8601.
+
+Finalidade: auditoria da criação do item.
+
+dataHoraAlteracao
+
+Tipo: String
+
+Formato recomendado: ISO-8601.
+
+Finalidade: auditoria da última alteração.
+
+dadosOperacao
+
+Tipo: Map
+
+Finalidade: armazenar os dados específicos da operação e do produto.
+
+Exemplo para RDB:
+
+valor = 15000.50
+
+dataOperacao = 2026-10-06
+
+codigoRdb = RDB001
+
+dataVencimento = 2028-10-06
+
+taxa = 0.125
+
+Um futuro CDB poderá possuir atributos diferentes dentro de dadosOperacao sem exigir a criação de novas colunas obrigatórias para todos os demais produtos.
+
+EXEMPLO CONCEITUAL DE UMA OPERAÇÃO
+
+idOperacao = OP-000001
+
+produto = RDB
+
+tipoOperacao = APLICACAO
+
+clearingDestino = B3
+
+chaveIdempotencia = ARQUIVO#20261006#000001
+
+versaoModelo = 1
+
+origem.tipo = ARQUIVO
+
+origem.identificador = ARQ-000001
+
+dataHoraInclusao = 2026-10-06T10:00:00.000Z
+
+dataHoraAlteracao = 2026-10-06T10:00:00.000Z
+
+dadosOperacao.valor = 15000.50
+
+dadosOperacao.dataOperacao = 2026-10-06
+
+dadosOperacao.codigoRdb = RDB001
+
+dadosOperacao.dataVencimento = 2028-10-06
+
+dadosOperacao.taxa = 0.125
+
+TABELA REGISTROS_CLEARING
+
+Finalidade:
+
+Armazenar o estado operacional atual do processo de registro da operação na clearing.
+
+A relação esperada inicialmente será:
+
+Uma operação possui um registro atual de clearing.
+
+Partition Key:
+
+idOperacao
+
+Tipo:
+
+String
+
+Sort Key:
+
+Não possui.
+
+Como cada operação será direcionada para somente uma clearing, não existe necessidade atual de utilizar a clearing como Sort Key.
+
+O idOperacao identifica diretamente o registro operacional atual.
+
+ATRIBUTOS PRINCIPAIS DE REGISTROS_CLEARING
+
+idOperacao
+
+Tipo: String
+
+Finalidade: Partition Key e correlação com a operação.
+
+idRegistro
+
+Tipo: String
+
+Finalidade: identificador interno do processo de registro.
+
+clearing
+
+Tipo: String
+
+Finalidade: clearing utilizada para o registro.
+
+status
+
+Tipo: String
+
+Finalidade: representar o estado operacional atual.
+
+Exemplos possíveis:
+
+PENDENTE
+
+EM_PROCESSAMENTO
+
+ENVIADO
+
+REGISTRADO
+
+ERRO
+
+idExterno
+
+Tipo: String
+
+Finalidade: armazenar o identificador utilizado/retornado pela clearing e permitir correlação quando o retorno assíncrono for recebido.
+
+Esse campo deverá permanecer fora de dadosRegistro porque possui função de correlação e poderá participar de índice.
+
+tentativa
+
+Tipo: Number
+
+Finalidade: controlar o número da tentativa atual de processamento.
+
+versaoModelo
+
+Tipo: Number
+
+Finalidade: versionamento do contrato.
+
+dataHoraInclusao
+
+Tipo: String
+
+Finalidade: auditoria.
+
+dataHoraAlteracao
+
+Tipo: String
+
+Finalidade: auditoria.
+
+dadosRegistro
+
+Tipo: Map
+
+Finalidade: armazenar informações específicas do processo de registro ou da clearing que não sejam necessárias para identificação, roteamento ou consulta direta.
+
+Exemplos:
+
+protocolo
+
+codigoRetorno
+
+mensagemRetorno
+
+informações específicas de uma determinada clearing
+
+EXEMPLO CONCEITUAL DE REGISTRO
+
+idOperacao = OP-000001
+
+idRegistro = REG-000001
+
+clearing = B3
+
+status = REGISTRADO
+
+idExterno = B3-20261006-000001
+
+tentativa = 1
+
+versaoModelo = 1
+
+dataHoraInclusao = 2026-10-06T10:00:10.000Z
+
+dataHoraAlteracao = 2026-10-06T10:05:00.000Z
+
+dadosRegistro.protocolo = PROTOCOLO-B3-001
+
+dadosRegistro.codigoRetorno = 00
+
+dadosRegistro.mensagemRetorno = Registro realizado com sucesso
+
+ÍNDICE PARA IDENTIFICADOR EXTERNO
+
+Deverá ser criado um Global Secondary Index na tabela REGISTROS_CLEARING para permitir localizar uma operação através do identificador externo utilizado pela clearing.
+
+Nome sugerido:
+
+INDICE_ID_EXTERNO
+
+Partition Key do índice:
+
+idExterno
+
+Esse índice será importante principalmente no fluxo de retorno.
+
+Exemplo:
+
+A plataforma envia OP-000001 para B3.
+
+O processo recebe ou associa o identificador B3-20261006-000001.
+
+Posteriormente é recebido um retorno contendo B3-20261006-000001.
+
+A aplicação consulta INDICE_ID_EXTERNO.
+
+O índice retorna o registro correspondente.
+
+A aplicação identifica idOperacao = OP-000001.
+
+A partir desse momento o retorno pode ser correlacionado com a operação interna.
+
+TABELA EVENTOS_REGISTRO
+
+Finalidade:
+
+Armazenar o histórico cronológico do processo de registro.
+
+Diferentemente de REGISTROS_CLEARING, que representa o estado atual, EVENTOS_REGISTRO deverá manter a timeline de como o registro chegou ao estado atual.
+
+A tabela deverá seguir o conceito append-only.
+
+Eventos históricos não deverão ser atualizados para representar novos estados.
+
+Uma mudança deverá produzir um novo evento.
+
+Partition Key:
+
+idOperacao
+
+Tipo:
+
+String
+
+Sort Key:
+
+chaveEvento
+
+Tipo:
+
+String
+
+COMPOSIÇÃO DA SORT KEY
+
+A chaveEvento deverá possuir uma composição que permita ordenação cronológica e unicidade.
+
+Formato sugerido:
+
+dataHoraEvento#idEvento
+
+Exemplo:
+
+2026-10-06T10:00:10.000Z#EVT-001
+
+2026-10-06T10:02:00.000Z#EVT-002
+
+2026-10-06T10:05:00.000Z#EVT-003
+
+Dessa forma, uma Query utilizando idOperacao retornará naturalmente a timeline da operação ordenada pela Sort Key.
+
+O idEvento no final da chave evita colisões caso mais de um evento possua o mesmo timestamp.
+
+ATRIBUTOS PRINCIPAIS DE EVENTOS_REGISTRO
+
+idOperacao
+
+Tipo: String
+
+Finalidade: Partition Key.
+
+chaveEvento
+
+Tipo: String
+
+Finalidade: Sort Key responsável pela ordenação cronológica.
+
+idEvento
+
+Tipo: String
+
+Finalidade: identificador único do evento.
+
+idRegistro
+
+Tipo: String
+
+Finalidade: correlação com o registro de clearing.
+
+tipoEvento
+
+Tipo: String
+
+Finalidade: identificar o que ocorreu.
+
+Exemplos:
+
+REGISTRO_CRIADO
+
+ENVIO_INICIADO
+
+ENVIADO_CLEARING
+
+STATUS_ALTERADO
+
+ERRO_REGISTRO
+
+RETORNO_RECEBIDO
+
+REPROCESSAMENTO_INICIADO
+
+statusAnterior
+
+Tipo: String
+
+Obrigatório somente quando aplicável.
+
+Finalidade: estado anterior do processo.
+
+statusAtual
+
+Tipo: String
+
+Obrigatório somente quando aplicável.
+
+Finalidade: novo estado do processo.
+
+origemEvento
+
+Tipo: String
+
+Finalidade: identificar qual componente originou o evento.
+
+Exemplos:
+
+INGESTAO
+
+REGISTRATION_WORKER
+
+ADAPTER_B3
+
+RETORNO_CLEARING
+
+REPROCESSAMENTO
+
+dataHoraEvento
+
+Tipo: String
+
+Formato recomendado: ISO-8601.
+
+Finalidade: data/hora em que o evento ocorreu.
+
+versaoModelo
+
+Tipo: Number
+
+Finalidade: versionamento do contrato.
+
+dadosEvento
+
+Tipo: Map
+
+Finalidade: armazenar informações específicas do evento.
+
+Exemplo para erro:
+
+codigoErro = B3-001
+
+descricao = Instrumento não encontrado
+
+tentativa = 2
+
+reprocessavel = true
+
+EXEMPLO DE TIMELINE
+
+Para idOperacao OP-000001 poderão existir:
+
+2026-10-06T10:00:10.000Z#EVT-001
+
+tipoEvento = REGISTRO_CRIADO
+
+statusAtual = PENDENTE
+
+2026-10-06T10:01:00.000Z#EVT-002
+
+tipoEvento = STATUS_ALTERADO
+
+statusAnterior = PENDENTE
+
+statusAtual = EM_PROCESSAMENTO
+
+2026-10-06T10:02:00.000Z#EVT-003
+
+tipoEvento = STATUS_ALTERADO
+
+statusAnterior = EM_PROCESSAMENTO
+
+statusAtual = ENVIADO
+
+2026-10-06T10:05:00.000Z#EVT-004
+
+tipoEvento = STATUS_ALTERADO
+
+statusAnterior = ENVIADO
+
+statusAtual = REGISTRADO
+
+RESUMO DAS CHAVES
+
+Tabela OPERACOES
+
+Partition Key: idOperacao
+
+Sort Key: não possui
+
+Tabela REGISTROS_CLEARING
+
+Partition Key: idOperacao
+
+Sort Key: não possui
+
+Tabela EVENTOS_REGISTRO
+
+Partition Key: idOperacao
+
+Sort Key: chaveEvento
+
+GLOBAL SECONDARY INDEXES
+
+REGISTROS_CLEARING deverá possuir inicialmente:
+
+INDICE_ID_EXTERNO
+
+Partition Key: idExterno
+
+Finalidade: correlação dos retornos recebidos das clearings.
+
+Em OPERACOES deverá ser avaliada a criação de:
+
+INDICE_IDEMPOTENCIA
+
+Partition Key: chaveIdempotencia
+
+Finalidade: permitir localizar uma operação através da chave de idempotência.
+
+Importante:
+
+O GSI de idempotência não deverá ser considerado isoladamente uma garantia de unicidade.
+
+O padrão:
+
+Consultar GSI
+
+Não encontrou
+
+Inserir operação
+
+não é suficiente para garantir idempotência em situações concorrentes.
+
+Dois processamentos podem consultar simultaneamente, ambos não encontrarem a operação e ambos tentarem inserir.
+
+A implementação da idempotência deverá utilizar estratégia segura para concorrência, utilizando escrita condicional e/ou mecanismo específico de controle de idempotência.
+
+A estratégia definitiva deverá ser validada durante a POC.
+
+CONSISTÊNCIA ENTRE OPERACOES E REGISTROS_CLEARING
+
+A criação inicial da operação deverá considerar a necessidade de consistência entre OPERACOES e REGISTROS_CLEARING.
+
+O estado indesejado é:
+
+OPERACOES contém OP-000001.
+
+REGISTROS_CLEARING não contém OP-000001.
+
+Quando os dois itens fizerem parte da mesma criação lógica, deverá ser utilizado TransactWriteItems ou mecanismo equivalente aprovado.
+
+O comportamento esperado é:
+
+Ou a operação e o registro são criados.
+
+Ou nenhum dos dois é criado.
+
+CONSISTÊNCIA ENTRE REGISTROS_CLEARING E EVENTOS_REGISTRO
+
+Quando o status de um registro for alterado, a atualização do snapshot e a criação do evento correspondente deverão permanecer consistentes.
+
+Exemplo:
+
+Estado atual:
+
+ENVIADO
+
+Novo estado:
+
+REGISTRADO
+
+A operação deverá realizar conceitualmente:
+
+Atualização de REGISTROS_CLEARING para REGISTRADO.
+
+Inclusão de um novo EVENTOS_REGISTRO contendo ENVIADO -> REGISTRADO.
+
+Deverá ser utilizado TransactWriteItems ou mecanismo equivalente quando a mudança exigir atomicidade entre as duas tabelas.
+
+Não deverá ocorrer como estado final:
+
+REGISTROS_CLEARING = REGISTRADO
+
+sem existir o evento correspondente.
+
+Da mesma forma, não deverá existir um evento informando REGISTRADO enquanto o snapshot permaneça ENVIADO.
+
+DYNAMODB STREAM
+
+Nesta etapa, somente a tabela OPERACOES deverá possuir o DynamoDB Stream necessário para iniciar posteriormente o fluxo assíncrono de registro.
+
+Fluxo previsto:
+
+OPERACOES
+
+DynamoDB Stream
+
+EventBridge Pipes
+
+SQS de registro
+
+Worker de registro
+
+Adapter da clearing
+
+Clearing
+
+As alterações realizadas em REGISTROS_CLEARING e EVENTOS_REGISTRO não deverão provocar automaticamente um novo envio para clearing.
+
+PADRÕES DE CONSULTA DA POC
+
+Consulta 1: buscar uma operação.
+
+Tabela:
+
+OPERACOES
+
+Operação:
+
+GetItem
+
+Chave:
+
+idOperacao = OP-000001
+
+Consulta 2: buscar o estado atual do registro.
+
+Tabela:
+
+REGISTROS_CLEARING
+
+Operação:
+
+GetItem
+
+Chave:
+
+idOperacao = OP-000001
+
+Consulta 3: buscar todo o histórico de uma operação.
+
+Tabela:
+
+EVENTOS_REGISTRO
+
+Operação:
+
+Query
+
+Condição:
+
+idOperacao = OP-000001
+
+O resultado deverá retornar todos os eventos da operação ordenados por chaveEvento.
+
+Consulta 4: buscar o último evento.
+
+Tabela:
+
+EVENTOS_REGISTRO
+
+Operação:
+
+Query
+
+Condição:
+
+idOperacao = OP-000001
+
+Ordenação:
+
+decrescente
+
+Limite:
+
+1
+
+Isso permitirá localizar o evento mais recente sem executar Scan completo.
+
+Consulta 5: localizar uma operação através do identificador externo.
+
+Tabela:
+
+REGISTROS_CLEARING
+
+Índice:
+
+INDICE_ID_EXTERNO
+
+Condição:
+
+idExterno = B3-20261006-000001
+
+CONSULTAS ANALÍTICAS E TELAS
+
+A modelagem desta história deverá priorizar o fluxo transacional de registro.
+
+Não deverão ser criados GSIs indiscriminadamente apenas para atender consultas como:
+
+Listar todas as operações.
+
+Listar operações por produto.
+
+Listar operações por clearing.
+
+Listar todas as operações registradas.
+
+Listar operações com erro.
+
+Contar operações em processamento.
+
+Contar operações registradas.
+
+Contar operações com erro.
+
+Montar dashboards históricos.
+
+Esses padrões de consulta possuem características analíticas diferentes das consultas transacionais.
+
+Caso essas necessidades sejam confirmadas, deverá ser avaliada posteriormente a criação de um Read Model específico.
+
+Uma possível evolução futura poderá utilizar exportação/replicação dos dados para S3 e consultas através do Athena ou outra solução apropriada.
+
+Essa decisão não faz parte do escopo desta história.
+
+VOLUMETRIA E PARTICIONAMENTO
+
+A solução deverá considerar alta volumetria.
+
+A tabela OPERACOES possuirá aproximadamente um item por operação.
+
+REGISTROS_CLEARING possuirá aproximadamente um registro atual por operação.
+
+EVENTOS_REGISTRO possuirá múltiplos itens por operação e deverá apresentar crescimento significativamente superior às demais tabelas.
+
+Exemplo apenas ilustrativo:
+
+20 milhões de operações.
+
+Média de 5 eventos por operação.
+
+EVENTOS_REGISTRO poderá possuir aproximadamente 100 milhões de itens.
+
+Por esse motivo, a tabela histórica foi separada das tabelas de operação e snapshot operacional.
+
+As Partition Keys não deverão utilizar valores de baixa cardinalidade, como:
+
+RDB
+
+CDB
+
+B3
+
+REGISTRADO
+
+ERRO
+
+Esses valores poderiam concentrar grande quantidade de dados na mesma chave lógica.
+
+idOperacao será utilizado como Partition Key principal por possuir alta cardinalidade.
+
+JUSTIFICATIVA DAS TRÊS TABELAS
+
+OPERACOES responde:
+
+O que é essa operação financeira?
+
+REGISTROS_CLEARING responde:
+
+Qual é o estado atual do registro dessa operação?
+
+EVENTOS_REGISTRO responde:
+
+Como o processo chegou ao estado atual?
+
+Portanto:
+
+OPERACOES representa o fato de negócio.
+
+REGISTROS_CLEARING representa o snapshot operacional.
+
+EVENTOS_REGISTRO representa a timeline/auditoria.
+
+FLEXIBILIDADE PARA NOVOS PRODUTOS
+
+Inicialmente será utilizado RDB.
+
+Posteriormente será incluído CDB.
+
+Novos produtos poderão surgir.
+
+A inclusão de um novo produto não deverá exigir a criação de uma nova tabela.
+
+Os atributos comuns e necessários ao funcionamento da plataforma permanecerão no envelope canônico.
+
+Os atributos específicos do produto serão armazenados em dadosOperacao.
+
+Exemplo:
+
+RDB poderá possuir codigoRdb e taxa.
+
+CDB poderá possuir codigoCdb, indexador e percentualIndexador.
+
+Um produto futuro poderá possuir outro conjunto de propriedades.
+
+A aplicação deverá validar dadosOperacao conforme produto e versaoModelo.
+
+FLEXIBILIDADE PARA NOVAS CLEARINGS
+
+A plataforma deverá suportar múltiplas clearings.
+
+Cada operação, entretanto, será destinada a somente uma clearing.
+
+Os atributos necessários ao funcionamento comum permanecerão no modelo canônico.
+
+Informações particulares do processo de uma determinada clearing poderão ser armazenadas em dadosRegistro ou dadosEvento, quando não forem necessárias para chave, índice, roteamento ou correlação.
+
+A estrutura DynamoDB não deverá ser remodelada para refletir diretamente cada novo contrato externo.
+
+MODELO PARA POWERDESIGNER
+
+O modelo lógico deverá representar:
+
+OPERACAO
+
+Relacionamento 1 para 1 com REGISTRO_CLEARING.
+
+REGISTRO_CLEARING
+
+Relacionamento 1 para N com EVENTO_REGISTRO.
+
+Entidade OPERACAO:
+
+idOperacao
+
+produto
+
+tipoOperacao
+
+clearingDestino
+
+chaveIdempotencia
+
+versaoModelo
+
+origem
+
+dataHoraInclusao
+
+dataHoraAlteracao
+
+dadosOperacao
+
+Entidade REGISTRO_CLEARING:
+
+idOperacao
+
+idRegistro
+
+clearing
+
+status
+
+idExterno
+
+tentativa
+
+versaoModelo
+
+dataHoraInclusao
+
+dataHoraAlteracao
+
+dadosRegistro
+
+Entidade EVENTO_REGISTRO:
+
+idOperacao
+
+chaveEvento
+
+idEvento
+
+idRegistro
+
+tipoEvento
+
+statusAnterior
+
+statusAtual
+
+origemEvento
+
+dataHoraEvento
+
+versaoModelo
+
+dadosEvento
+
+No modelo físico deverá ficar explícito:
+
+OPERACOES
+
+PK = idOperacao String
+
+Sem SK.
+
+REGISTROS_CLEARING
+
+PK = idOperacao String
+
+Sem SK.
+
+GSI INDICE_ID_EXTERNO:
+
+PK = idExterno String.
+
+EVENTOS_REGISTRO
+
+PK = idOperacao String.
+
+SK = chaveEvento String.
+
+POC
+
+Antes da implementação definitiva via Terraform, deverá ser realizada uma POC da estrutura.
+
+Para a POC poderão ser criadas manualmente no AWS Console as três tabelas.
+
+Configuração sugerida:
+
+OPERACOES
+
+Partition Key = idOperacao
+
+Tipo = String
+
+Sem Sort Key
+
+Capacity Mode = On-demand
+
+REGISTROS_CLEARING
+
+Partition Key = idOperacao
+
+Tipo = String
+
+Sem Sort Key
+
+Capacity Mode = On-demand
+
+GSI = INDICE_ID_EXTERNO
+
+GSI Partition Key = idExterno
+
+EVENTOS_REGISTRO
+
+Partition Key = idOperacao
+
+Tipo = String
+
+Sort Key = chaveEvento
+
+Tipo da Sort Key = String
+
+Capacity Mode = On-demand
+
+A POC deverá possuir massa suficiente para demonstrar:
+
+Uma aplicação RDB registrada com sucesso.
+
+Um resgate RDB em processamento.
+
+Uma operação com erro.
+
+Operações destinadas à clearing configurada.
+
+Histórico com múltiplas mudanças de status.
+
+Correlação utilizando idExterno.
+
+Consulta da timeline completa.
+
+Consulta do último evento.
+
+Validação de TransactWriteItems.
+
+Teste da estratégia de idempotência.
+
+Inclusão de dados específicos em dadosOperacao, dadosRegistro e dadosEvento.
+
+INFRAESTRUTURA DEFINITIVA
+
+Após a validação da POC e aprovação do modelo, a infraestrutura definitiva deverá ser provisionada através de Terraform.
+
+O Terraform deverá contemplar:
+
+Criação das três tabelas.
+
+Partition Keys.
+
+Sort Key de EVENTOS_REGISTRO.
+
+INDICE_ID_EXTERNO.
+
+INDICE_IDEMPOTENCIA caso seja aprovado após a POC.
+
+DynamoDB Stream de OPERACOES quando aplicável ao fluxo.
+
+Capacity Mode definido pelo projeto.
+
+Criptografia seguindo padrão corporativo.
+
+Tags corporativas.
+
+Backup/PITR conforme padrão corporativo.
+
+IAM seguindo princípio de menor privilégio.
+
+CRITÉRIOS DE ACEITE
+
+CA01 - Devem existir três tabelas distintas: OPERACOES, REGISTROS_CLEARING e EVENTOS_REGISTRO.
+
+CA02 - OPERACOES deve utilizar idOperacao do tipo String como Partition Key e não possuir Sort Key.
+
+CA03 - REGISTROS_CLEARING deve utilizar idOperacao do tipo String como Partition Key e não possuir Sort Key.
+
+CA04 - EVENTOS_REGISTRO deve utilizar idOperacao do tipo String como Partition Key e chaveEvento do tipo String como Sort Key.
+
+CA05 - Deve ser possível recuperar uma operação diretamente através de idOperacao sem executar Scan.
+
+CA06 - Deve ser possível recuperar o estado atual do registro diretamente através de idOperacao sem executar Scan.
+
+CA07 - Deve ser possível recuperar todo o histórico de uma operação através de Query utilizando idOperacao.
+
+CA08 - Os eventos de uma operação devem ser retornados em ordem cronológica através da Sort Key chaveEvento.
+
+CA09 - Deve ser possível recuperar somente o último evento de uma operação utilizando Query com ordenação decrescente e limite igual a 1.
+
+CA10 - REGISTROS_CLEARING deve possuir INDICE_ID_EXTERNO utilizando idExterno como Partition Key.
+
+CA11 - Deve ser possível localizar o registro interno correspondente através de idExterno.
+
+CA12 - OPERACOES deve possuir chaveIdempotencia e a estratégia definitiva de idempotência deve ser validada na POC.
+
+CA13 - A solução de idempotência deve impedir duplicidade mesmo em cenário concorrente.
+
+CA14 - O GSI de idempotência, caso utilizado, não poderá ser considerado isoladamente como garantia de unicidade.
+
+CA15 - A criação lógica de uma nova operação e seu registro inicial não poderá produzir estado parcial quando a regra exigir a existência de ambos.
+
+CA16 - Deve ser validado o uso de TransactWriteItems para operações que necessitem atomicidade entre tabelas.
+
+CA17 - Uma alteração de status deverá atualizar REGISTROS_CLEARING e produzir o respectivo EVENTOS_REGISTRO de maneira consistente.
+
+CA18 - EVENTOS_REGISTRO deverá seguir o conceito append-only.
+
+CA19 - Eventos históricos existentes não deverão ser alterados para representar novos estados.
+
+CA20 - Cada novo estado relevante deverá produzir um novo evento histórico.
+
+CA21 - Deve existir versionamento explícito através de versaoModelo.
+
+CA22 - Os dados específicos de produtos deverão ser armazenados em dadosOperacao.
+
+CA23 - Os dados específicos do processo de registro deverão ser armazenados em dadosRegistro quando não precisarem participar de chave, índice, roteamento ou correlação.
+
+CA24 - Os dados específicos dos eventos deverão ser armazenados em dadosEvento.
+
+CA25 - Deve ser possível armazenar operações RDB e CDB sem criar tabelas diferentes por produto.
+
+CA26 - A inclusão de um novo produto não deverá exigir alteração estrutural das tabelas quando os novos dados forem específicos do produto.
+
+CA27 - A inclusão de uma nova clearing não deverá exigir remodelagem do domínio para reproduzir o contrato externo dessa clearing.
+
+CA28 - Cada operação deverá possuir somente uma clearing de destino.
+
+CA29 - O modelo DynamoDB não deverá depender do layout do CSV.
+
+CA30 - O modelo DynamoDB não deverá depender do contrato Kafka.
+
+CA31 - CSV, Kafka e futuras origens deverão ser adaptados para o mesmo modelo canônico antes da persistência.
+
+CA32 - O modelo DynamoDB não deverá reproduzir diretamente o contrato da B3 ou de qualquer outra clearing.
+
+CA33 - Deve ser possível rastrear a origem de uma operação.
+
+CA34 - A estrutura deverá permitir futura implementação de reprocessamento sem alterar eventos históricos.
+
+CA35 - A estrutura deverá permitir futura implementação de conciliação.
+
+CA36 - A POC deverá demonstrar consultas de operação, registro atual, histórico completo, último evento e correlação por idExterno.
+
+CA37 - A POC deverá demonstrar a flexibilidade dos Maps dadosOperacao, dadosRegistro e dadosEvento.
+
+CA38 - Não deverão ser adicionados GSIs exclusivamente para consultas analíticas sem que exista um padrão de acesso transacional justificado.
+
+CA39 - Consultas analíticas e dashboards deverão ser avaliados posteriormente através de Read Model específico.
+
+CA40 - A infraestrutura definitiva deverá ser criada e versionada através de Terraform.
+
+CA41 - O modelo lógico e físico deverá ser documentado no PowerDesigner conforme normativa da empresa.
+
+CA42 - A configuração deverá seguir os padrões corporativos de segurança, criptografia, backup, tags e IAM.
+
+CA43 - A estrutura deverá estar preparada para a volumetria prevista sem utilizar produto, clearing ou status como Partition Key principal das tabelas transacionais.
+
+CA44 - A POC deverá ser aprovada antes da criação da infraestrutura definitiva.
+
+CA45 - Após a POC, as decisões sobre idempotência, índices e capacidade deverão ser registradas antes da aprovação do modelo definitivo.
+
+RESULTADO ESPERADO
+
+Ao término desta história, deverá existir uma estrutura DynamoDB validada através de POC e documentada no PowerDesigner, composta pelas tabelas OPERACOES, REGISTROS_CLEARING e EVENTOS_REGISTRO.
+
+A estrutura deverá separar claramente o fato financeiro, o estado operacional atual e o histórico do processo de registro.
+
+O modelo deverá permanecer independente das origens de entrada e das APIs das clearings.
+
+A flexibilidade física do DynamoDB deverá ser utilizada através de dadosOperacao, dadosRegistro e dadosEvento, mantendo ao mesmo tempo um envelope canônico controlado e versionado pela plataforma.
+
+A estrutura resultante deverá permitir a evolução da solução para novos produtos, novas clearings, Kafka, reprocessamento, conciliação e futuros modelos de leitura sem exigir remodelagem completa da persistência transacional.
