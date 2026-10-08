@@ -84,1182 +84,661 @@ Se tudo estiver certo, em alguns segundos as 3 linhas do arquivo devem aparecer 
 terraform destroy
 ```
 
-# Título
+TÍTULO
 
-Criar estrutura DynamoDB para operações de registro em Clearing
+H02 - Implementar ingestão de operações financeiras via AWS Batch com adaptação para o modelo canônico e publicação no Amazon SQS
 
-# Objetivo
+DESCRIÇÃO
 
-Criar, através de Terraform, a estrutura DynamoDB responsável por armazenar operações financeiras destinadas a registro em clearing, o estado atual do registro e o histórico dos eventos ocorridos durante o processo.
+Como plataforma de registro de operações financeiras em múltiplas clearings, precisamos implementar um processo de ingestão em lote utilizando AWS Batch, responsável por receber, interpretar, validar, transformar e publicar operações financeiras provenientes de arquivos disponibilizados no Amazon S3.
 
-A solução deverá suportar múltiplos produtos e múltiplas clearings, respeitando a regra:
+O processo deverá suportar inicialmente arquivos CSV contendo operações de aplicações e resgates de produtos financeiros, começando pelo produto RDB, com possibilidade de expansão para CDB e outros produtos.
 
-> Cada operação deverá possuir exatamente uma clearing de destino.
+A volumetria esperada é de aproximadamente 2 a 3 milhões de operações por dia, podendo existir mais de um arquivo no mesmo dia.
 
-O conceito de multi-clearing significa que a plataforma poderá registrar operações em diferentes clearings, mas cada operação individual será destinada a apenas uma delas.
+O processamento deverá ser desenvolvido em .NET 8 ou versão homologada pelo projeto, executado em contêiner Docker no AWS Batch.
 
-Exemplo:
+A solução deverá permitir a inclusão de novos produtos e formatos de entrada sem necessidade de alterar o fluxo principal de ingestão.
 
-```text
-OP001 → B3
-OP002 → B3
-OP003 → CLEARING_X
-```
+As operações deverão ser transformadas para o modelo canônico definido pelo projeto e publicadas em uma fila Amazon SQS destinada à ingestão de operações.
 
-Inicialmente serão processadas operações de RDB destinadas à B3.
+O AWS Batch não será responsável pela persistência direta das operações no DynamoDB.
 
-O modelo deverá permitir futuramente CDB, novos produtos e novas clearings sem alteração da estrutura principal das chaves.
+A responsabilidade de consumir as mensagens da fila, validar a idempotência de persistência e gravar os registros nas tabelas OPERACOES e REGISTROS_CLEARING será de um componente consumidor independente, contemplado em história específica.
 
-As operações poderão ter origem em arquivo CSV e, futuramente, Kafka. A estrutura persistida deverá ser independente dessas fontes.
+O fluxo de registro nas clearings permanecerá desacoplado da ingestão, sendo iniciado após a persistência das operações, conforme a arquitetura definida para o projeto.
 
----
+OBJETIVO
 
-# Descrição detalhada
+Implementar um processo robusto e escalável de ingestão de arquivos financeiros que permita interpretar diferentes layouts, transformar registros para um modelo canônico e publicar as operações no Amazon SQS com segurança, rastreabilidade e mecanismos de recuperação.
 
-## 1. Modelo conceitual
+A solução deverá garantir que falhas de publicação sejam identificadas e tratadas, evitando perda silenciosa de operações.
 
-O modelo será composto por três entidades:
+ARQUITETURA PROPOSTA
 
-```text
-OPERACAO
-    │
-    │ 1:1
-    ▼
-REGISTRO_CLEARING
-    │
-    │ 1:N
-    ▼
-EVENTO_REGISTRO
-```
+Fluxo de ingestão:
 
-### OPERACAO
+Amazon S3
+→ Evento de criação do arquivo
+→ EventBridge / mecanismo de orquestração
+→ AWS Batch
+→ Leitura streaming do CSV
+→ Parser específico do layout
+→ Adaptador do produto
+→ Validação da operação
+→ Modelo canônico
+→ Publicação em lote no Amazon SQS
 
-Representa o fato financeiro que deverá ser registrado.
+Fluxo posterior, fora do escopo desta história:
 
-Responde:
+Amazon SQS de ingestão
+→ Lambda ou serviço consumidor
+→ Validação de idempotência
+→ DynamoDB OPERACOES
+→ DynamoDB REGISTROS_CLEARING
+→ DynamoDB Streams
+→ EventBridge Pipes
+→ SQS de registro
+→ Worker de integração com a clearing
 
-> O que precisa ser registrado e para qual clearing?
+A fila de ingestão deverá ser distinta da fila utilizada para o envio de operações às clearings.
 
-### REGISTRO_CLEARING
+ESCOPO FUNCIONAL
 
-Representa o processo de registro da operação na clearing determinada.
+1. RECEBIMENTO E IDENTIFICAÇÃO DOS ARQUIVOS
 
-Responde:
+O processo deverá ser iniciado a partir da disponibilização de um arquivo CSV em um bucket S3 previamente configurado.
 
-> Qual é a situação atual do registro?
+O evento de criação do objeto deverá acionar o mecanismo de orquestração responsável por iniciar o job do AWS Batch.
 
-### EVENTO_REGISTRO
+O job deverá receber, no mínimo:
 
-Representa os acontecimentos ocorridos durante o ciclo de vida do registro.
+- Bucket de origem.
+- Chave do objeto no S3.
+- Identificador único do arquivo.
+- Tipo de produto financeiro.
+- Versão do layout.
+- Data de referência do processamento.
+- Identificador de correlação da execução.
 
-Responde:
+O identificador do arquivo deverá permitir reconhecer reprocessamentos e relacionar as operações à sua origem.
 
-> O que aconteceu com esse registro?
+A identificação do objeto deverá considerar mecanismos que permitam distinguir versões diferentes de um arquivo quando necessário.
 
-Os eventos deverão possuir comportamento append-only.
+O sistema deverá validar a existência e a acessibilidade do arquivo antes de iniciar sua leitura.
 
----
+Arquivos inexistentes, inacessíveis, vazios ou com layout incompatível deverão gerar falha controlada.
 
-# 2. Modelo canônico e origens
+2. LEITURA EFICIENTE DO CSV
 
-O sistema poderá receber operações através de diferentes fontes.
+A leitura deverá ocorrer em streaming, evitando carregar todo o arquivo em memória.
 
-Inicialmente:
+O processo deverá suportar arquivos contendo aproximadamente 2 a 3 milhões de registros e permitir crescimento futuro da volumetria.
 
-```text
-CSV
-```
+A implementação deverá utilizar um parser CSV compatível com o layout recebido, respeitando corretamente delimitadores, cabeçalhos, campos opcionais, campos entre aspas, caracteres especiais e codificação.
 
-Futuramente:
+A leitura deverá ser incremental.
 
-```text
-Kafka
-```
+O processamento não poderá depender do carregamento integral do arquivo em memória.
 
-As fontes não deverão determinar a estrutura interna de persistência.
+Deverão ser identificadas e tratadas situações como:
 
-Cada entrada deverá ser transformada por seu respectivo adaptador para o modelo canônico:
+- Arquivo sem cabeçalho obrigatório.
+- Colunas ausentes.
+- Quantidade inválida de colunas.
+- Campos obrigatórios vazios.
+- Valores numéricos inválidos.
+- Datas inválidas.
+- Linhas malformadas.
+- Codificação incompatível.
+- Arquivo interrompido ou corrompido.
 
-```text
-CSV
- │
- ▼
-Adaptador CSV
- │
- └────────────┐
-              ▼
-           OPERACAO
-              ▲
- ┌────────────┘
- │
-Adaptador Kafka
- ▲
- │
-Kafka
-```
+Erros isolados de conteúdo não deverão necessariamente interromper o processamento completo, desde que seja possível identificar e isolar a linha inválida.
 
-Alterações no formato do CSV ou no contrato Kafka não deverão obrigatoriamente alterar o domínio de clearing.
+Erros estruturais que impeçam a interpretação confiável do arquivo deverão interromper o processamento.
 
----
+3. ARQUITETURA DE ADAPTADORES POR PRODUTO
 
-# 3. Regra de clearing única
+A implementação deverá separar a leitura física do arquivo da interpretação de negócio dos registros.
 
-Cada `OPERACAO` deverá possuir exatamente uma clearing de destino.
+O fluxo principal do AWS Batch não deverá conter regras específicas de RDB, CDB ou de qualquer outro produto financeiro.
 
-```text
-OPERACAO 1 ───────── 1 REGISTRO_CLEARING
-```
+Deverá existir um mecanismo de resolução de adaptadores com base no produto e na versão do layout.
 
-A operação possuirá:
+Cada adaptador será responsável por interpretar os campos específicos do produto e transformá-los para o modelo canônico.
 
-```text
-clearingDestino
-```
+Inicialmente, deverá ser implementado o adaptador para RDB.
 
-Exemplo:
+A arquitetura deverá permitir a inclusão posterior de adaptadores para CDB e outros produtos, sem necessidade de alterar o mecanismo principal de leitura ou publicação.
 
-```json
-{
-  "idOperacao": "OP-000001",
-  "tipoOperacao": "APLICACAO",
-  "produto": "RDB",
-  "clearingDestino": "B3",
-  "valor": 15000.50
-}
-```
+Responsabilidades sugeridas:
 
----
+Parser: interpreta a estrutura física do CSV e produz um registro de entrada.
 
-# 4. Estrutura física DynamoDB
+Adapter: transforma o registro específico do produto em uma operação canônica.
 
-Será utilizada inicialmente uma única tabela:
+Validator: valida as regras estruturais e de negócio aplicáveis à operação.
 
-```text
-OPERACOES_CLEARING
-```
+SqsPublisher: publica as operações canônicas no Amazon SQS.
 
-utilizando Single Table Design.
+ProcessingCoordinator: controla leitura, concorrência, contabilização, publicação e tratamento de falhas.
 
-A tabela possuirá chave primária composta.
+4. MODELO CANÔNICO
 
-| Conceito DynamoDB | Nome físico | Tipo |
-|---|---|---|
-| Partition Key | `identificadorAgregado` | String |
-| Sort Key | `chaveEntidade` | String |
+Toda operação válida deverá ser convertida para o modelo canônico definido para a plataforma.
 
----
+O modelo deverá conter, no mínimo:
 
-# 5. Funcionamento das chaves
+idOperacao: identificador único da operação.
 
-## identificadorAgregado — Partition Key
+produto: identificação do produto financeiro, inicialmente RDB.
 
-O campo:
+tipoOperacao: APLICACAO ou RESGATE.
 
-```text
-identificadorAgregado
-```
+clearingDestino: identificação da clearing responsável pelo registro.
 
-responde:
+chaveIdempotencia: identificador determinístico utilizado para prevenir processamento duplicado.
 
-> De qual operação estes dados fazem parte?
+versaoModelo: versão do contrato canônico.
 
-Convenção:
+origem: estrutura contendo o tipo da origem e o identificador do arquivo.
 
-```text
-OPERACAO#<idOperacao>
-```
+dataHoraInclusao: data e hora de criação da operação no contexto da ingestão.
 
-Exemplo:
+dadosOperacao: estrutura flexível contendo os atributos específicos do produto.
 
-```text
-OPERACAO#OP-000001
-```
+O contrato da mensagem deverá incluir os metadados necessários para rastreabilidade e correlação.
 
-Todos os itens relacionados à operação utilizarão o mesmo `identificadorAgregado`.
+A operação deverá possuir apenas uma clearing de destino.
 
----
+O modelo deverá ser versionado para permitir evolução sem quebra de compatibilidade com consumidores existentes.
 
-## chaveEntidade — Sort Key
+O Batch deverá produzir mensagens compatíveis com o contrato esperado pelo consumidor da fila.
 
-O campo:
+5. VALIDAÇÃO DAS OPERAÇÕES
 
-```text
-chaveEntidade
-```
+As validações deverão ocorrer antes da publicação no SQS.
 
-responde:
+Deverão existir validações estruturais comuns a todos os produtos e validações específicas implementadas pelo respectivo adaptador ou validador.
 
-> Qual informação dentro da operação este item representa?
+As validações comuns deverão contemplar, quando aplicáveis:
 
-Convenções:
+- Presença de identificadores obrigatórios.
+- Produto reconhecido.
+- Tipo de operação permitido.
+- Clearing de destino informada e suportada.
+- Datas em formato válido.
+- Valores monetários em formato válido.
+- Identificação da origem.
+- Versão do modelo suportada.
+- Chave de idempotência válida.
 
-```text
-OPERACAO
+As validações específicas de RDB deverão ser definidas conforme o contrato de entrada homologado com a área de negócio.
 
-REGISTRO
+O sistema não deverá presumir regras financeiras que não tenham sido formalmente aprovadas.
 
-REGISTRO#EVENTO#<timestamp>#<idEvento>
-```
+Registros inválidos não deverão ser publicados na fila de ingestão.
 
-Exemplo:
+Esses registros deverão ser contabilizados e associados a um motivo de rejeição.
 
-```text
-identificadorAgregado = OPERACAO#OP-000001
+O processo deverá permitir distinguir erros de validação, erros de transformação e falhas técnicas de publicação.
 
-├── chaveEntidade = OPERACAO
-├── chaveEntidade = REGISTRO
-├── chaveEntidade = REGISTRO#EVENTO#...#EVT-001
-├── chaveEntidade = REGISTRO#EVENTO#...#EVT-002
-└── chaveEntidade = REGISTRO#EVENTO#...#EVT-003
-```
+6. IDENTIFICAÇÃO E IDEMPOTÊNCIA
 
-Regra mental:
+O processo deverá ser seguro para reexecução.
 
-```text
-identificadorAgregado
-"De qual operação?"
+O reprocessamento de um arquivo poderá resultar na republicação de mensagens já enviadas anteriormente, especialmente em cenários de falha parcial ou interrupção do job.
 
-chaveEntidade
-"O que é dentro da operação?"
-```
+Por esse motivo, cada operação deverá possuir uma chave de idempotência estável e determinística, conforme as regras de identificação de negócio.
 
----
+A chave deverá permanecer igual para a mesma operação, independentemente da execução do Batch.
 
-# 6. Convenção final das chaves
+O identificador de execução não deverá compor a identidade de negócio de maneira que gere uma nova chave a cada reprocessamento.
 
-| Entidade | identificadorAgregado | chaveEntidade |
-|---|---|---|
-| OPERACAO | `OPERACAO#<idOperacao>` | `OPERACAO` |
-| REGISTRO_CLEARING | `OPERACAO#<idOperacao>` | `REGISTRO` |
-| EVENTO_REGISTRO | `OPERACAO#<idOperacao>` | `REGISTRO#EVENTO#<timestamp>#<idEvento>` |
+O AWS Batch não deverá depender de consultas ao DynamoDB para verificar a existência prévia da operação.
 
----
+A deduplicação definitiva deverá ser realizada pelo consumidor responsável pela persistência.
 
-# 7. Estrutura da OPERACAO
+A solução deverá assumir que mensagens podem ser entregues mais de uma vez pelo SQS.
 
-Principais atributos:
+Caso seja utilizada uma fila SQS Standard, não haverá garantia de ordenação global ou de entrega exatamente uma vez.
 
-| Campo | Finalidade |
-|---|---|
-| `idOperacao` | Identificador interno da operação |
-| `tipoOperacao` | APLICAÇÃO, RESGATE etc. |
-| `produto` | RDB, CDB etc. |
-| `clearingDestino` | Clearing responsável pelo registro |
-| `valor` | Valor financeiro |
-| `dataOperacao` | Data da operação |
-| `tipoOrigem` | ARQUIVO, KAFKA etc. |
-| `idOperacaoOrigem` | Identificação recebida da origem |
-| `chaveIdempotencia` | Identidade lógica para deduplicação |
-| `dadosProduto` | Dados específicos do produto |
-| `dataHoraCriacao` | Data/hora de criação |
+A estratégia de idempotência deverá considerar explicitamente essas características.
 
----
+7. PUBLICAÇÃO NO AMAZON SQS
 
-# 8. Estrutura do REGISTRO_CLEARING
+O AWS Batch deverá publicar as operações canônicas em uma fila Amazon SQS específica para ingestão.
 
-Representa o snapshot atual do processo de registro.
+A publicação deverá utilizar o AWS SDK for .NET.
 
-Como cada operação possuirá uma única clearing, existirá no máximo um `REGISTRO_CLEARING` por operação.
+Deverá ser priorizado o uso de SendMessageBatch para reduzir a quantidade de chamadas à API e melhorar a eficiência.
 
-Principais atributos:
+Cada chamada SendMessageBatch poderá conter até dez mensagens, respeitando os limites de tamanho da operação e das mensagens.
 
-| Campo | Finalidade |
-|---|---|
-| `idRegistro` | Identificador interno |
-| `idOperacao` | Operação relacionada |
-| `clearing` | Clearing utilizada |
-| `status` | Estado atual |
-| `idExterno` | Identificador utilizado na integração |
-| `protocoloExterno` | Protocolo retornado pela clearing |
-| `tentativa` | Quantidade/número da tentativa |
-| `dataHoraEnvio` | Momento do envio |
-| `dataHoraRetorno` | Momento do retorno |
-| `dataHoraAtualizacao` | Última atualização |
+A implementação deverá validar o tamanho do payload antes da publicação.
 
----
+O processo não deverá tentar publicar mensagens acima do limite permitido pelo SQS.
 
-# 9. Estrutura do EVENTO_REGISTRO
+A estrutura da mensagem deverá conter os dados canônicos necessários para a persistência posterior, evitando a necessidade de o consumidor reler o CSV original.
 
-Representa os fatos ocorridos durante o ciclo de vida do registro.
+Metadados de correlação poderão ser transmitidos por atributos de mensagem ou pelo envelope, respeitando os limites do serviço.
 
-Principais atributos:
+O publisher deverá tratar individualmente o resultado de cada mensagem enviada em lote.
 
-| Campo | Finalidade |
-|---|---|
-| `idEvento` | Identificador do evento |
-| `idRegistro` | Registro relacionado |
-| `idOperacao` | Operação relacionada |
-| `tipoEvento` | Tipo do acontecimento |
-| `statusAnterior` | Status anterior, quando aplicável |
-| `statusAtual` | Status resultante |
-| `origemEvento` | Origem do acontecimento |
-| `dataHoraEvento` | Data/hora do evento |
+Uma resposta HTTP de sucesso para SendMessageBatch não significa necessariamente que todas as mensagens do lote foram aceitas.
 
-Os eventos deverão ser append-only.
+A implementação deverá verificar as coleções de mensagens aceitas e rejeitadas retornadas pela API.
 
----
+Somente mensagens confirmadas como aceitas poderão ser contabilizadas como publicadas.
 
-# 10. Ordenação dos eventos
+Mensagens rejeitadas deverão ser submetidas à política de retry ou registradas como falha definitiva.
 
-A Sort Key:
+8. CONTROLE DE CONCORRÊNCIA E THROUGHPUT
 
-```text
-REGISTRO#EVENTO#<timestamp>#<idEvento>
-```
+O processo deverá permitir configuração do número máximo de operações em transformação e publicação simultânea.
 
-permite ordenação cronológica.
+A implementação deverá utilizar concorrência controlada e buffers com capacidade limitada.
 
-Exemplo:
+O processamento não poderá acumular milhões de objetos em memória enquanto aguarda a publicação.
 
-```text
-REGISTRO#EVENTO#20261001T100030.000Z#EVT-001
-REGISTRO#EVENTO#20261001T100100.000Z#EVT-002
-REGISTRO#EVENTO#20261001T100500.000Z#EVT-003
-REGISTRO#EVENTO#20261001T100501.000Z#EVT-004
-```
+O número de workers, o tamanho dos lotes, a quantidade de requisições concorrentes e os limites de processamento deverão ser configuráveis por ambiente.
 
-O `idEvento` também garante unicidade caso dois eventos possuam o mesmo timestamp.
+O processo deverá aplicar backpressure quando houver aumento de latência, throttling ou falhas na publicação para o SQS.
 
----
+Deverão ser implementadas tentativas com exponential backoff e jitter para falhas transitórias.
 
-# 11. Índice por identificador externo
+O objetivo de throughput deverá ser validado em testes de carga com 2 e 3 milhões de operações.
 
-Deverá existir o GSI:
+Como referência, publicar 3 milhões de mensagens em duas horas exige uma média aproximada de 417 mensagens por segundo.
 
-```text
-INDICE_ID_EXTERNO
-```
+Com lotes completos de dez mensagens, isso representa aproximadamente 42 chamadas SendMessageBatch por segundo, desconsiderando retries e mensagens rejeitadas.
 
-| Conceito | Campo |
-|---|---|
-| GSI Partition Key | `identificadorExterno` |
-| GSI Sort Key | `identificadorRegistro` |
+A capacidade do consumidor e o crescimento do backlog da fila deverão ser avaliados em conjunto com a taxa de publicação.
 
-Convenção:
+O Batch não deverá assumir que a aceitação das mensagens pelo SQS significa que o processamento completo da operação foi concluído.
 
-```text
-identificadorExterno =
-ID_EXTERNO#<idExterno>
+9. TRATAMENTO DE FALHAS NA PUBLICAÇÃO
 
-identificadorRegistro =
-REGISTRO#<idOperacao>
-```
+O processo deverá distinguir:
 
-Exemplo:
+Falhas de leitura do S3.
 
-```text
-identificadorExterno =
-ID_EXTERNO#CLEARING-000001
+Falhas estruturais do arquivo.
 
-identificadorRegistro =
-REGISTRO#OP-000001
-```
+Falhas de validação.
 
-Somente itens que possuírem esses atributos participarão do índice.
+Falhas de transformação para o modelo canônico.
 
-Inicialmente serão os itens `REGISTRO_CLEARING`.
+Falhas transitórias do SQS.
 
-O índice será, portanto, esparso.
+Rejeições individuais em SendMessageBatch.
 
----
+Falhas permanentes de publicação.
 
-# 12. Padrões de consulta
+Falhas de infraestrutura ou interrupção do job.
 
-## AP01 — Buscar operação
+Falhas transitórias deverão ser submetidas a tentativas controladas.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = OPERACAO
-```
+Não deverão existir retries indefinidos.
 
-## AP02 — Buscar registro atual
+A implementação deverá considerar que uma chamada pode ter sido aceita pelo SQS mesmo quando o cliente não recebeu a confirmação devido a uma falha de comunicação.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = REGISTRO
-```
+Nesses casos, a repetição da publicação poderá produzir mensagens duplicadas.
 
-## AP03 — Buscar agregado completo
+A recuperação deverá preservar a chave de idempotência original.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-```
+Falhas permanentes de publicação não poderão ser contabilizadas como sucesso.
 
-Retorna operação, registro atual e eventos.
+O job deverá finalizar com falha ou estado de execução parcialmente concluída, conforme a política formalmente definida, caso existam operações válidas que não tenham sido publicadas após as tentativas permitidas.
 
-## AP04 — Buscar histórico
+10. REPROCESSAMENTO E RECUPERAÇÃO
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
+O processo deverá permitir reprocessamento integral do arquivo.
 
-chaveEntidade begins_with
-REGISTRO#EVENTO#
-```
+O reprocessamento deverá utilizar as mesmas regras de identificação e transformação aplicadas à execução original.
 
-## AP05 — Buscar último evento
+Operações já publicadas poderão ser republicadas.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
+A solução deverá depender da idempotência do consumidor para impedir persistência duplicada e registros financeiros duplicados.
 
-chaveEntidade begins_with
-REGISTRO#EVENTO#
+Deverá existir mecanismo para identificar a execução original e suas tentativas posteriores.
 
-ScanIndexForward = false
-Limit = 1
-```
+A necessidade de checkpoints por linha ou por bloco deverá ser avaliada durante a POC.
 
-## AP06 — Buscar pelo identificador externo
+Não deverá ser implementado um mecanismo complexo de checkpoint sem evidência de necessidade.
 
-Utilizar:
+O processo deverá permitir recuperação após falhas ocorridas depois da publicação parcial do arquivo.
 
-```text
-INDICE_ID_EXTERNO
-```
+11. RASTREABILIDADE DO ARQUIVO
 
-com:
+Cada execução deverá possuir um identificador único.
 
-```text
-identificadorExterno =
-ID_EXTERNO#<idExterno>
-```
+O processamento deverá registrar, no mínimo:
 
----
+Identificador da execução.
 
-# 13. Massa de dados para POC
+Identificador do arquivo.
 
-A massa abaixo deverá permitir validar os principais padrões de acesso definidos nesta história.
+Bucket e chave do objeto.
 
-Serão criadas duas operações:
+Produto.
 
-```text
-OP-000001
-Aplicação de RDB
-B3
-ACEITO
+Versão do layout.
 
-OP-000002
-Resgate de RDB
-B3
-REJEITADO
-```
+Data de referência.
 
----
+Horário de início.
 
-# 14. POC — Operação 1
+Horário de término.
 
-## 14.1 OPERACAO
+Quantidade total de linhas lidas.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000001",
-  "chaveEntidade": "OPERACAO",
-  "tipoEntidade": "OPERACAO",
+Quantidade de operações válidas.
 
-  "idOperacao": "OP-000001",
-  "tipoOperacao": "APLICACAO",
-  "produto": "RDB",
-  "clearingDestino": "B3",
+Quantidade de operações publicadas com confirmação de aceite pelo SQS.
 
-  "valor": 15000.50,
-  "dataOperacao": "2026-10-01",
+Quantidade de registros rejeitados por validação.
 
-  "tipoOrigem": "ARQUIVO",
-  "idOperacaoOrigem": "ARQ-987654",
-  "chaveIdempotencia": "ARQUIVO#ARQ-987654",
+Quantidade de falhas de transformação.
 
-  "dadosProduto": {
-    "numeroRdb": "RDB-987654",
-    "indexador": "CDI",
-    "taxa": 102.5,
-    "dataVencimento": "2027-10-01"
-  },
+Quantidade de falhas de publicação.
 
-  "dataHoraCriacao": "2026-10-01T10:00:00Z"
-}
-```
+Quantidade de mensagens submetidas a retry.
 
----
+Quantidade de operações não publicadas após esgotamento das tentativas.
 
-## 14.2 REGISTRO_CLEARING
+Status final da execução.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000001",
-  "chaveEntidade": "REGISTRO",
-  "tipoEntidade": "REGISTRO_CLEARING",
+Os totais deverão permitir conciliação entre o conteúdo do arquivo e o resultado da publicação.
 
-  "idOperacao": "OP-000001",
-  "idRegistro": "REG-000001",
+12. RELATÓRIO DE PROCESSAMENTO
 
-  "clearing": "B3",
-  "status": "ACEITO",
+Ao final de cada execução, deverá ser produzido um relatório contendo o resultado da ingestão.
 
-  "idExterno": "CLEARING-000001",
-  "protocoloExterno": "B3-PROT-987654",
+O relatório deverá apresentar os totais de linhas processadas, operações válidas, mensagens publicadas, rejeições e falhas técnicas.
 
-  "tentativa": 1,
+As inconsistências deverão possuir informações suficientes para identificação da linha e da causa do problema.
 
-  "identificadorExterno": "ID_EXTERNO#CLEARING-000001",
-  "identificadorRegistro": "REGISTRO#OP-000001",
+O armazenamento de arquivos de rejeição no S3 poderá ser utilizado conforme política de segurança e retenção definida pelo projeto.
 
-  "dataHoraCriacao": "2026-10-01T10:00:30Z",
-  "dataHoraEnvio": "2026-10-01T10:01:00Z",
-  "dataHoraRetorno": "2026-10-01T10:05:00Z",
-  "dataHoraAtualizacao": "2026-10-01T10:05:01Z"
-}
-```
+O relatório deverá distinguir claramente:
 
----
+Operação publicada no SQS.
 
-## 14.3 EVENTO — Registro criado
+Operação persistida no DynamoDB.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000001",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T100030.000Z#EVT-001",
-  "tipoEntidade": "EVENTO_REGISTRO",
+Operação enviada à clearing.
 
-  "idOperacao": "OP-000001",
-  "idRegistro": "REG-000001",
-  "idEvento": "EVT-001",
+Operação registrada na clearing.
 
-  "tipoEvento": "REGISTRO_CRIADO",
-  "statusAtual": "PENDENTE",
+Esta história será responsável apenas pela confirmação da primeira etapa.
 
-  "origemEvento": "SISTEMA_CLEARING",
-  "dataHoraEvento": "2026-10-01T10:00:30Z"
-}
-```
+Os demais estados pertencem aos componentes posteriores do fluxo.
 
----
+13. OBSERVABILIDADE
 
-## 14.4 EVENTO — Envio realizado
+A solução deverá disponibilizar logs estruturados e métricas operacionais.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000001",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T100100.000Z#EVT-002",
-  "tipoEntidade": "EVENTO_REGISTRO",
+Os logs deverão conter identificadores de correlação, arquivo, execução e operação, quando aplicável.
 
-  "idOperacao": "OP-000001",
-  "idRegistro": "REG-000001",
-  "idEvento": "EVT-002",
+Deverão ser disponibilizadas métricas para:
 
-  "tipoEvento": "ENVIO_REALIZADO",
+Linhas lidas por segundo.
 
-  "statusAnterior": "PENDENTE",
-  "statusAtual": "ENVIADO",
+Operações transformadas por segundo.
 
-  "origemEvento": "REGISTRATION_WORKER",
+Mensagens publicadas por segundo.
 
-  "tentativa": 1,
-  "idExterno": "CLEARING-000001",
+Quantidade de chamadas SendMessageBatch.
 
-  "dataHoraEvento": "2026-10-01T10:01:00Z"
-}
-```
+Quantidade de mensagens por lote.
 
----
+Tempo médio e percentis de publicação.
 
-## 14.5 EVENTO — Retorno recebido
+Quantidade de mensagens rejeitadas.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000001",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T100500.000Z#EVT-003",
-  "tipoEntidade": "EVENTO_REGISTRO",
+Quantidade de retries.
 
-  "idOperacao": "OP-000001",
-  "idRegistro": "REG-000001",
-  "idEvento": "EVT-003",
+Throttling do SQS.
 
-  "tipoEvento": "RETORNO_RECEBIDO",
+Tempo total de execução.
 
-  "origemEvento": "PISMO",
+Utilização de CPU e memória do job.
 
-  "idEventoExterno": "PISMO-EVT-789",
-  "idExterno": "CLEARING-000001",
-  "protocoloExterno": "B3-PROT-987654",
+Deverá ser possível correlacionar uma execução do Batch com as mensagens publicadas.
 
-  "dataHoraEvento": "2026-10-01T10:05:00Z"
-}
-```
+A solução deverá permitir integração com as ferramentas de observabilidade adotadas pela empresa.
 
----
+Não deverão ser gerados logs individuais de sucesso para cada operação em nível INFO, salvo necessidade justificada, evitando custos elevados de observabilidade.
 
-## 14.6 EVENTO — Operação aceita
+14. SEGURANÇA
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000001",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T100501.000Z#EVT-004",
-  "tipoEntidade": "EVENTO_REGISTRO",
+O job deverá utilizar IAM Role com princípio do menor privilégio.
 
-  "idOperacao": "OP-000001",
-  "idRegistro": "REG-000001",
-  "idEvento": "EVT-004",
+As permissões deverão limitar o acesso ao bucket S3 de origem e à fila SQS de ingestão.
 
-  "tipoEvento": "STATUS_ALTERADO",
+O AWS Batch não deverá receber permissões de escrita no DynamoDB, salvo outra necessidade explicitamente aprovada e fora deste escopo.
 
-  "statusAnterior": "ENVIADO",
-  "statusAtual": "ACEITO",
+Não deverão existir credenciais AWS fixas no código ou na imagem Docker.
 
-  "origemEvento": "RETORNO_CLEARING",
+A comunicação com os serviços AWS deverá utilizar conexões seguras.
 
-  "idEventoExterno": "PISMO-EVT-789",
-  "idExterno": "CLEARING-000001",
-  "protocoloExterno": "B3-PROT-987654",
+A configuração deverá ser fornecida por variáveis de ambiente, parâmetros gerenciados ou mecanismos equivalentes.
 
-  "dataHoraEvento": "2026-10-01T10:05:01Z"
-}
-```
+A solução deverá respeitar as políticas de criptografia, proteção de dados e retenção estabelecidas pela empresa.
 
----
+15. INFRAESTRUTURA AWS
 
-# 15. POC — Operação 2
+A infraestrutura deverá contemplar:
 
-A segunda operação deverá permitir validar que diferentes operações permanecem isoladas através do `identificadorAgregado`.
+Definição do AWS Batch Job Definition.
 
-## 15.1 OPERACAO
+Ambiente computacional adequado à execução do contêiner.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000002",
-  "chaveEntidade": "OPERACAO",
-  "tipoEntidade": "OPERACAO",
+Fila de jobs do AWS Batch.
 
-  "idOperacao": "OP-000002",
-  "tipoOperacao": "RESGATE",
-  "produto": "RDB",
-  "clearingDestino": "B3",
+Imagem Docker armazenada no Amazon ECR.
 
-  "valor": 8500.00,
-  "dataOperacao": "2026-10-01",
+IAM Roles e políticas necessárias.
 
-  "tipoOrigem": "ARQUIVO",
-  "idOperacaoOrigem": "ARQ-987655",
-  "chaveIdempotencia": "ARQUIVO#ARQ-987655",
+Integração com o bucket S3 de entrada.
 
-  "dadosProduto": {
-    "numeroRdb": "RDB-123456"
-  },
+Mecanismo de acionamento a partir do evento de criação do objeto.
 
-  "dataHoraCriacao": "2026-10-01T11:00:00Z"
-}
-```
+Fila SQS de ingestão de operações.
 
----
+Configuração de logs.
 
-## 15.2 REGISTRO_CLEARING
+Parâmetros de CPU, memória, concorrência, timeout e retries.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000002",
-  "chaveEntidade": "REGISTRO",
-  "tipoEntidade": "REGISTRO_CLEARING",
+Configurações de rede necessárias ao acesso ao S3 e SQS.
 
-  "idOperacao": "OP-000002",
-  "idRegistro": "REG-000002",
+A fila deverá possuir política de retenção compatível com o tempo máximo esperado de indisponibilidade dos consumidores e com a estratégia de recuperação.
 
-  "clearing": "B3",
-  "status": "REJEITADO",
+A necessidade de uma DLQ para a fila de ingestão deverá ser tratada na história do consumidor, incluindo política de redrive.
 
-  "idExterno": "CLEARING-000002",
-  "protocoloExterno": "B3-PROT-123456",
+A infraestrutura definitiva deverá ser implementada por Terraform, seguindo os padrões adotados pela empresa.
 
-  "codigoRetorno": "B3-001",
-  "descricaoRetorno": "Operacao rejeitada pela clearing",
+16. TESTES
 
-  "tentativa": 1,
+Deverão ser realizados testes unitários, de integração e de carga.
 
-  "identificadorExterno": "ID_EXTERNO#CLEARING-000002",
-  "identificadorRegistro": "REGISTRO#OP-000002",
+Os testes deverão contemplar:
 
-  "dataHoraCriacao": "2026-10-01T11:00:30Z",
-  "dataHoraEnvio": "2026-10-01T11:01:00Z",
-  "dataHoraRetorno": "2026-10-01T11:04:00Z",
-  "dataHoraAtualizacao": "2026-10-01T11:04:01Z"
-}
-```
+Leitura de CSV válido.
 
----
+Leitura de arquivo vazio.
 
-## 15.3 EVENTO — Registro criado
+Layout inválido.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000002",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T110030.000Z#EVT-101",
-  "tipoEntidade": "EVENTO_REGISTRO",
+Campos obrigatórios ausentes.
 
-  "idOperacao": "OP-000002",
-  "idRegistro": "REG-000002",
-  "idEvento": "EVT-101",
+Valores monetários inválidos.
 
-  "tipoEvento": "REGISTRO_CRIADO",
-  "statusAtual": "PENDENTE",
+Datas inválidas.
 
-  "origemEvento": "SISTEMA_CLEARING",
-  "dataHoraEvento": "2026-10-01T11:00:30Z"
-}
-```
+Produto não suportado.
 
----
+Transformação correta de RDB.
 
-## 15.4 EVENTO — Enviado
+Geração do modelo canônico.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000002",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T110100.000Z#EVT-102",
-  "tipoEntidade": "EVENTO_REGISTRO",
+Geração estável da chave de idempotência.
 
-  "idOperacao": "OP-000002",
-  "idRegistro": "REG-000002",
-  "idEvento": "EVT-102",
+Publicação de mensagem válida no SQS.
 
-  "tipoEvento": "ENVIO_REALIZADO",
+Publicação em lote com até dez mensagens.
 
-  "statusAnterior": "PENDENTE",
-  "statusAtual": "ENVIADO",
+Falha parcial de SendMessageBatch.
 
-  "origemEvento": "REGISTRATION_WORKER",
+Throttling do SQS.
 
-  "tentativa": 1,
-  "idExterno": "CLEARING-000002",
+Timeout na publicação.
 
-  "dataHoraEvento": "2026-10-01T11:01:00Z"
-}
-```
+Retry com backoff.
 
----
+Reprocessamento integral do arquivo.
 
-## 15.5 EVENTO — Rejeitado
+Interrupção do Batch após publicação parcial.
 
-```json
-{
-  "identificadorAgregado": "OPERACAO#OP-000002",
-  "chaveEntidade": "REGISTRO#EVENTO#20261001T110401.000Z#EVT-103",
-  "tipoEntidade": "EVENTO_REGISTRO",
+Consumo de memória durante processamento de arquivos grandes.
 
-  "idOperacao": "OP-000002",
-  "idRegistro": "REG-000002",
-  "idEvento": "EVT-103",
+Teste de publicação de 2 milhões de operações.
 
-  "tipoEvento": "STATUS_ALTERADO",
+Teste de publicação de 3 milhões de operações.
 
-  "statusAnterior": "ENVIADO",
-  "statusAtual": "REJEITADO",
+17. FORA DO ESCOPO
 
-  "origemEvento": "RETORNO_CLEARING",
+Não fazem parte desta história:
 
-  "idExterno": "CLEARING-000002",
-  "protocoloExterno": "B3-PROT-123456",
+Persistência direta das operações no DynamoDB.
 
-  "codigoRetorno": "B3-001",
-  "descricaoRetorno": "Operacao rejeitada pela clearing",
+Implementação do consumidor SQS responsável por criar OPERACOES e REGISTROS_CLEARING.
 
-  "dataHoraEvento": "2026-10-01T11:04:01Z"
-}
-```
+Criação ou atualização de EVENTOS_REGISTRO.
 
----
+Envio das operações para a clearing.
 
-# 16. Validações da POC
+Processamento de retornos da clearing.
 
-Após inserir os itens, deverão ser executados os seguintes testes.
+Atualização posterior de status de registro.
 
-| Teste | Consulta | Resultado esperado |
-|---|---|---|
-| Buscar operação | `OP-000001 + OPERACAO` | Aplicação RDB |
-| Buscar registro | `OP-000001 + REGISTRO` | Status ACEITO |
-| Agregado completo | `OPERACAO#OP-000001` | 6 itens |
-| Histórico | `begins_with(REGISTRO#EVENTO#)` | 4 eventos |
-| Último evento | Histórico descendente + Limit 1 | EVT-004 / ACEITO |
-| ID externo | `ID_EXTERNO#CLEARING-000001` | REG-000001 |
-| Segunda operação | `OPERACAO#OP-000002` | 5 itens |
-| Segundo ID externo | `ID_EXTERNO#CLEARING-000002` | REG-000002 |
+Conciliação financeira com a clearing.
 
-Para a primeira operação, uma Query somente por:
+Implementação da futura ingestão via Kafka.
 
-```text
-identificadorAgregado =
-OPERACAO#OP-000001
-```
+Consultas operacionais e relatórios sobre as operações persistidas.
 
-deverá apresentar:
+CRITÉRIOS DE ACEITE
 
-```text
-OPERACAO#OP-000001
-│
-├── OPERACAO
-│
-├── REGISTRO
-│
-├── REGISTRO#EVENTO#20261001T100030.000Z#EVT-001
-│
-├── REGISTRO#EVENTO#20261001T100100.000Z#EVT-002
-│
-├── REGISTRO#EVENTO#20261001T100500.000Z#EVT-003
-│
-└── REGISTRO#EVENTO#20261001T100501.000Z#EVT-004
-```
+CA01 - O AWS Batch deverá ser iniciado a partir de um arquivo disponibilizado no S3, por meio do mecanismo de orquestração definido.
 
-Isso deverá comprovar que operação, estado atual e histórico estão agrupados no mesmo agregado.
+CA02 - O job deverá receber os parâmetros necessários para identificar arquivo, produto, versão de layout e execução.
 
----
+CA03 - A leitura do arquivo deverá ocorrer em streaming, sem carregamento integral em memória.
 
-# 17. Flexibilidade por produto
+CA04 - A solução deverá processar corretamente arquivos CSV válidos do produto RDB.
 
-Dados particulares do produto deverão ficar em:
+CA05 - O parser deverá identificar arquivos estruturalmente inválidos e produzir diagnóstico apropriado.
 
-```text
-dadosProduto
-```
+CA06 - O fluxo principal de ingestão deverá ser independente das regras específicas de cada produto financeiro.
 
-Exemplo RDB:
+CA07 - A implementação deverá utilizar adaptadores para transformação dos registros de entrada em operações canônicas.
 
-```json
-{
-  "produto": "RDB",
-  "dadosProduto": {
-    "numeroRdb": "RDB-987654",
-    "indexador": "CDI",
-    "taxa": 102.5
-  }
-}
-```
+CA08 - A inclusão futura de novos adaptadores não deverá exigir alteração do fluxo principal de leitura e publicação.
 
-Exemplo futuro CDB:
+CA09 - Toda operação válida deverá ser transformada para o contrato canônico homologado.
 
-```json
-{
-  "produto": "CDB",
-  "dadosProduto": {
-    "codigoCdb": "CDB-123456",
-    "indexador": "CDI",
-    "taxa": 105.0
-  }
-}
-```
+CA10 - O contrato canônico deverá conter produto, tipo de operação, clearing de destino, identificadores, origem, versão e dados específicos.
 
-A inclusão de novos produtos não deverá exigir alteração de `identificadorAgregado` ou `chaveEntidade`.
+CA11 - O contrato deverá possuir mecanismo explícito de versionamento.
 
----
+CA12 - As validações comuns e específicas do produto deverão ocorrer antes da publicação.
 
-# 18. Flexibilidade por clearing
+CA13 - Registros inválidos não deverão ser publicados na fila SQS de ingestão.
 
-Conceitualmente:
+CA14 - Registros rejeitados deverão ser contabilizados e possuir motivo identificável.
 
-```text
-OPERACAO
-    │
-    │ clearingDestino
-    ▼
-Roteamento
-    │
-    ├── B3 → Adaptador B3
-    ├── X  → Adaptador X
-    └── Y  → Adaptador Y
-```
+CA15 - O AWS Batch deverá publicar as operações canônicas em uma fila Amazon SQS específica para ingestão.
 
-A inclusão de uma nova clearing não deverá exigir alteração da estrutura das chaves.
+CA16 - O AWS Batch não deverá realizar persistência direta nas tabelas DynamoDB.
 
----
+CA17 - A publicação deverá utilizar o AWS SDK for .NET.
 
-# 19. Idempotência
+CA18 - A solução deverá suportar publicação em lotes por SendMessageBatch.
 
-O processamento deverá considerar:
+CA19 - O publisher deverá respeitar os limites de quantidade e tamanho de mensagens estabelecidos pelo SQS.
 
-- reprocessamento do mesmo arquivo;
-- mensagens duplicadas;
-- reexecução após falha parcial;
-- processamento concorrente;
-- futura entrada através de Kafka.
+CA20 - O publisher deverá verificar individualmente o resultado das mensagens em SendMessageBatch.
 
-O campo:
+CA21 - Mensagens rejeitadas em um lote não poderão ser contabilizadas como publicadas.
 
-```text
-chaveIdempotencia
-```
+CA22 - Falhas transitórias deverão utilizar retries controlados com exponential backoff e jitter.
 
-representará a identidade lógica utilizada para deduplicação.
+CA23 - O processo deverá possuir limite configurável de tentativas de publicação.
 
-Exemplo:
+CA24 - Falhas definitivas de publicação deverão ser registradas e refletidas no resultado da execução.
 
-```text
-ARQUIVO#ARQ-987654
-```
+CA25 - A solução deverá permitir configurar a concorrência e o tamanho dos lotes de publicação.
 
-Um GUID aleatório utilizado como `idOperacao`, isoladamente, não deverá ser considerado garantia de idempotência.
+CA26 - A implementação deverá utilizar buffers limitados e mecanismos de backpressure para evitar consumo excessivo de memória.
 
-A estratégia definitiva deverá considerar as garantias fornecidas pelos sistemas produtores.
+CA27 - A chave de idempotência de uma operação deverá permanecer estável entre execuções e reprocessamentos do arquivo.
 
----
+CA28 - O reprocessamento de um arquivo deverá ser suportado sem alteração indevida da identidade de negócio das operações.
 
-# Requisitos
+CA29 - A solução deverá admitir a possibilidade de mensagens duplicadas, sem assumir garantia de entrega exatamente uma vez pelo SQS.
 
-**RF01 — Tabela**
+CA30 - A responsabilidade pela deduplicação definitiva deverá pertencer ao consumidor de persistência.
 
-Deverá existir:
+CA31 - O AWS Batch deverá permitir rastrear cada mensagem até seu arquivo e execução de origem.
 
-```text
-OPERACOES_CLEARING
-```
+CA32 - A execução deverá registrar totais de linhas lidas, operações válidas, mensagens publicadas, rejeições e falhas.
 
-**RF02 — Partition Key**
+CA33 - O processo deverá produzir relatório final de ingestão com informações suficientes para conciliação dos registros do arquivo.
 
-```text
-identificadorAgregado
-```
+CA34 - O relatório deverá distinguir mensagens aceitas pelo SQS de operações efetivamente persistidas no DynamoDB.
 
-String.
+CA35 - O job não poderá ser considerado integralmente bem-sucedido caso existam operações válidas não publicadas após esgotamento das tentativas.
 
-**RF03 — Sort Key**
+CA36 - O processo deverá disponibilizar logs estruturados e métricas de throughput, latência, retries, falhas e utilização de recursos.
 
-```text
-chaveEntidade
-```
+CA37 - Os logs não deverão expor indiscriminadamente dados sensíveis das operações financeiras.
 
-String.
+CA38 - O job deverá utilizar IAM Role com permissões restritas aos recursos necessários.
 
-**RF04 — OPERACAO**
+CA39 - O código e a imagem Docker não deverão conter credenciais AWS fixas.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = OPERACAO
-```
+CA40 - A infraestrutura deverá ser provisionada por Terraform conforme os padrões da empresa.
 
-**RF05 — REGISTRO_CLEARING**
+CA41 - Deverá existir imagem Docker versionada e publicada no Amazon ECR.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = REGISTRO
-```
+CA42 - A implementação deverá possuir testes unitários para parser, adaptadores, validadores e publisher.
 
-**RF06 — EVENTO_REGISTRO**
+CA43 - Deverão existir testes de integração para publicação no SQS, incluindo falhas parciais de SendMessageBatch.
 
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
+CA44 - Deverá ser validado o comportamento do processo em situações de throttling, timeout e falhas transitórias do SQS.
 
-chaveEntidade =
-REGISTRO#EVENTO#<timestamp>#<idEvento>
-```
+CA45 - Deverá ser validado o reprocessamento de um arquivo após interrupção com publicação parcial.
 
-**RF07 — Clearing única**
+CA46 - Deverá ser realizado teste de carga com 2 milhões de operações.
 
-Cada operação deverá possuir exatamente uma clearing de destino.
+CA47 - Deverá ser realizado teste de carga com 3 milhões de operações.
 
-**RF08 — Registro único**
+CA48 - O teste de carga deverá registrar throughput, duração total, consumo de CPU, memória, latência e quantidade de retries.
 
-Cada operação deverá possuir no máximo um snapshot `REGISTRO_CLEARING`.
+CA49 - A solução deverá demonstrar que consegue processar o volume esperado dentro da janela de ingestão definida pelo projeto, quando essa janela for homologada.
 
-**RF09 — Eventos**
+CA50 - O fluxo de ingestão deverá permanecer desacoplado do fluxo de persistência e registro nas clearings.
 
-Um registro poderá possuir múltiplos eventos.
+CA51 - A publicação bem-sucedida no SQS deverá representar exclusivamente a confirmação de aceite da mensagem pela fila, não a confirmação de persistência ou registro financeiro.
 
-**RF10 — Append-only**
+CA52 - A implementação deverá possuir documentação técnica de execução, configuração, monitoramento, tratamento de falhas e reprocessamento.
 
-Eventos existentes não deverão ser sobrescritos.
+DEFINIÇÃO DE PRONTO
 
-**RF11 — GSI**
+A história será considerada concluída quando o AWS Batch conseguir receber um arquivo CSV do S3, interpretar seus registros, aplicar o adaptador RDB, validar as operações, gerar o modelo canônico e publicar todas as operações válidas no SQS, com rastreabilidade e tratamento adequado de falhas.
 
-Deverá existir:
+A solução deverá possuir testes automatizados, infraestrutura provisionada, observabilidade operacional e evidências de teste de carga.
 
-```text
-INDICE_ID_EXTERNO
-```
-
-utilizando:
-
-```text
-Partition Key = identificadorExterno
-Sort Key = identificadorRegistro
-```
-
-**RF12 — Produtos**
-
-Novos produtos não deverão exigir alteração das chaves principais.
-
-**RF13 — Clearings**
-
-Novas clearings não deverão exigir alteração das chaves principais.
-
-**RF14 — Origem**
-
-O modelo deverá ser independente da origem da operação.
-
-**RF15 — Idempotência**
-
-O modelo deverá suportar uma estratégia de idempotência para evitar processamento duplicado.
-
-**RF16 — Terraform**
-
-A estrutura oficial deverá ser provisionada através de Terraform.
-
----
-
-# Critérios de aceite
-
-**CA01**
-
-Deverá ser possível persistir uma operação utilizando:
-
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = OPERACAO
-```
-
-**CA02**
-
-Deverá ser possível persistir o registro atual utilizando:
-
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = REGISTRO
-```
-
-**CA03**
-
-Uma operação não deverá possuir mais de um snapshot `REGISTRO_CLEARING`.
-
-**CA04**
-
-Deverá ser possível persistir múltiplos eventos utilizando:
-
-```text
-identificadorAgregado =
-OPERACAO#<idOperacao>
-
-chaveEntidade =
-REGISTRO#EVENTO#<timestamp>#<idEvento>
-```
-
-**CA05**
-
-Eventos deverão permanecer append-only.
-
-**CA06**
-
-Uma Query utilizando somente:
-
-```text
-identificadorAgregado =
-OPERACAO#<idOperacao>
-```
-
-deverá recuperar o agregado completo.
-
-**CA07**
-
-A combinação:
-
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = OPERACAO
-```
-
-deverá recuperar exclusivamente a operação.
-
-**CA08**
-
-A combinação:
-
-```text
-identificadorAgregado = OPERACAO#<idOperacao>
-chaveEntidade = REGISTRO
-```
-
-deverá recuperar exclusivamente o snapshot atual do registro.
-
-**CA09**
-
-Uma Query utilizando:
-
-```text
-identificadorAgregado =
-OPERACAO#<idOperacao>
-
-chaveEntidade begins_with
-REGISTRO#EVENTO#
-```
-
-deverá recuperar a timeline do registro.
-
-**CA10**
-
-Deverá ser possível recuperar o último evento através da ordenação decrescente da Sort Key e `Limit = 1`.
-
-**CA11**
-
-Deverá ser possível localizar um registro pelo `idExterno` através do `INDICE_ID_EXTERNO`.
-
-**CA12**
-
-Uma operação deverá possuir exatamente uma clearing de destino.
-
-**CA13**
-
-Novos produtos não deverão exigir alteração da estrutura das chaves.
-
-**CA14**
-
-Novas clearings não deverão exigir alteração da estrutura das chaves.
-
-**CA15**
-
-A POC deverá validar pelo menos:
-
-```text
-Aplicação RDB aceita pela B3
-
-Resgate RDB rejeitado pela B3
-
-Consulta do agregado
-
-Consulta da timeline
-
-Consulta do último evento
-
-Consulta pelo identificador externo
-```
-
-**CA16**
-
-A estrutura oficial deverá estar declarada através de Terraform.
-
----
-
-# Resumo final das chaves
-
-| Item | identificadorAgregado | chaveEntidade |
-|---|---|---|
-| Operação | `OPERACAO#<idOperacao>` | `OPERACAO` |
-| Registro | `OPERACAO#<idOperacao>` | `REGISTRO` |
-| Evento | `OPERACAO#<idOperacao>` | `REGISTRO#EVENTO#<timestamp>#<idEvento>` |
-
-GSI:
-
-| Índice | Partition Key | Sort Key |
-|---|---|---|
-| `INDICE_ID_EXTERNO` | `identificadorExterno` | `identificadorRegistro` |
-
-Regra mental final:
-
-```text
-identificadorAgregado
-        │
-        └── "De qual operação?"
-
-chaveEntidade
-        │
-        └── "O que é dentro da operação?"
-
-identificadorExterno
-        │
-        └── "Qual identificação recebemos do mundo externo?"
-
-identificadorRegistro
-        │
-        └── "A qual registro/operação ela corresponde?"
-```
+A persistência no DynamoDB e o registro efetivo nas clearings não serão requisitos para conclusão desta história, pois pertencem a etapas posteriores da arquitetura.
