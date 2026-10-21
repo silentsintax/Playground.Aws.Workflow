@@ -1,744 +1,685 @@
-# Pipeline: S3 → EventBridge → AWS Batch → SQS → Lambda → DynamoDB
-
-## Arquitetura
-
-1. Um arquivo `.txt` é enviado ao bucket S3.
-2. O S3 emite um evento `Object Created` para o **EventBridge** (bus padrão).
-3. Uma regra do EventBridge dispara um **AWS Batch job** (Fargate), passando `bucket` e `key` como parâmetros.
-4. O job (container Python) baixa o arquivo do S3, quebra em linhas e envia cada linha como mensagem para uma fila **SQS**.
-5. Uma **Lambda**, acionada pela fila SQS, grava cada linha como um item no **DynamoDB**.
-
-## Pré-requisitos
-
-- Terraform >= 1.5
-- AWS CLI configurado (`aws configure`) com permissões de administrador (ou equivalentes a IAM, S3, Batch, ECR, SQS, Lambda, DynamoDB, EventBridge)
-- Docker instalado (para build da imagem do Batch)
-
-## Passo a passo
-
-### 1. Deploy da infraestrutura base
-
-```bash
-cd tf-pipeline
-terraform init
-terraform apply
-```
-
-Na primeira vez isso cria tudo, **inclusive o repositório ECR vazio**. O Job Definition do Batch aponta para `<repo>:latest`, mas essa imagem ainda não existe — o job vai falhar até você fazer o passo 2.
-
-### 2. Build e push da imagem do Batch
-
-```bash
-REGION=$(terraform output -raw ecr_repository_url | cut -d. -f4)
-REPO_URL=$(terraform output -raw ecr_repository_url)
-
-aws ecr get-login-password --region $REGION | \
-  docker login --username AWS --password-stdin $(echo $REPO_URL | cut -d/ -f1)
-
-cd batch-job
-docker build -t $REPO_URL:latest .
-docker push $REPO_URL:latest
-cd ..
-```
-
-### 3. Testar o pipeline
-
-Crie um arquivo de teste e envie ao bucket:
-
-```bash
-BUCKET=$(terraform output -raw upload_bucket_name)
-
-printf "linha 1\nlinha 2\nlinha 3\n" > teste.txt
-aws s3 cp teste.txt s3://$BUCKET/teste.txt
-```
-
-Acompanhe:
-
-```bash
-# Ver o job do Batch sendo criado/rodando
-aws batch list-jobs --job-queue $(terraform output -raw batch_job_queue_name) --job-status RUNNING
-
-# Ver logs do job no CloudWatch (grupo /aws/batch/job)
-aws logs tail /aws/batch/job --follow
-
-# Ver logs da Lambda
-aws logs tail /aws/lambda/$(terraform output -raw lambda_function_name) --follow
-
-# Conferir os itens gravados no DynamoDB
-aws dynamodb scan --table-name $(terraform output -raw dynamodb_table_name)
-```
-
-Se tudo estiver certo, em alguns segundos as 3 linhas do arquivo devem aparecer como itens no DynamoDB.
-
-## Observações importantes
-
-- **Mecanismo bucket/key → Batch**: o EventBridge usa um `input_transformer` para extrair `bucket` e `key` do evento S3 e injetá-los como *Parameters* do job (`Ref::bucket`, `Ref::key` no `command`). Esse é o padrão oficial da AWS para passar dados do evento para o Batch.
-- **VPC**: o projeto usa a VPC e as subnets *default* da sua conta/região, com uma tarefa Fargate com IP público, apenas para simplificar. Em produção, prefira subnets privadas + NAT Gateway ou VPC endpoints para S3/SQS/ECR.
-- **Formato do arquivo**: o script assume texto simples, uma linha = um registro. Se o arquivo for CSV/JSON, ajuste `process_file.py`.
-- **Duplicidade/erros**: mensagens que falharem 5x na Lambda vão para a DLQ `linepipe-lines-dlq`.
-- **Custos**: Fargate, Lambda, DynamoDB on-demand e SQS têm custo por uso — bucket vazio e sem tráfego custam próximo de zero.
-
-## Limpeza
-
-```bash
-terraform destroy
-```
-
 TÍTULO
 
-H02 - Implementar ingestão de operações financeiras via AWS Batch com adaptação para o modelo canônico e publicação no Amazon SQS
+H04 - Implementar consumidor de operações do Amazon SQS com persistência transacional no DynamoDB
 
 DESCRIÇÃO
 
-Como plataforma de registro de operações financeiras em múltiplas clearings, precisamos implementar um processo de ingestão em lote utilizando AWS Batch, responsável por receber, interpretar, validar, transformar e publicar operações financeiras provenientes de arquivos disponibilizados no Amazon S3.
+Como plataforma de registro de operações financeiras em múltiplas clearings, precisamos implementar um componente responsável por consumir operações financeiras disponibilizadas em uma fila Amazon SQS e realizar sua persistência no Amazon DynamoDB.
 
-O processo deverá suportar inicialmente arquivos CSV contendo operações de aplicações e resgates de produtos financeiros, começando pelo produto RDB, com possibilidade de expansão para CDB e outros produtos.
+As mensagens serão publicadas inicialmente pelo processo de ingestão via AWS Batch, responsável pela leitura dos arquivos CSV, validação e transformação dos registros para o modelo canônico.
 
-A volumetria esperada é de aproximadamente 2 a 3 milhões de operações por dia, podendo existir mais de um arquivo no mesmo dia.
+O consumidor deverá receber essas mensagens, validar sua estrutura, aplicar os mecanismos de idempotência e persistir as informações nas tabelas OPERACOES e REGISTROS_CLEARING.
 
-O processamento deverá ser desenvolvido em .NET 8 ou versão homologada pelo projeto, executado em contêiner Docker no AWS Batch.
+A criação dos registros deverá ocorrer de maneira transacional, garantindo que a operação financeira e seu registro inicial de clearing sejam persistidos conjuntamente.
 
-A solução deverá permitir a inclusão de novos produtos e formatos de entrada sem necessidade de alterar o fluxo principal de ingestão.
+A solução deverá suportar uma volumetria de aproximadamente 2 a 3 milhões de operações por dia, considerando picos de processamento decorrentes da ingestão de arquivos.
 
-As operações deverão ser transformadas para o modelo canônico definido pelo projeto e publicadas em uma fila Amazon SQS destinada à ingestão de operações.
+O componente deverá ser implementado utilizando AWS Lambda e .NET 8, ou versão homologada pelo projeto.
 
-O AWS Batch não será responsável pela persistência direta das operações no DynamoDB.
+O processamento deverá ser resiliente a falhas, mensagens duplicadas, entregas fora de ordem, reprocessamentos e indisponibilidades temporárias do DynamoDB.
 
-A responsabilidade de consumir as mensagens da fila, validar a idempotência de persistência e gravar os registros nas tabelas OPERACOES e REGISTROS_CLEARING será de um componente consumidor independente, contemplado em história específica.
-
-O fluxo de registro nas clearings permanecerá desacoplado da ingestão, sendo iniciado após a persistência das operações, conforme a arquitetura definida para o projeto.
+Após a persistência bem-sucedida, o DynamoDB Streams da tabela OPERACOES será responsável por disponibilizar o evento de criação para o fluxo posterior de registro na clearing.
 
 OBJETIVO
 
-Implementar um processo robusto e escalável de ingestão de arquivos financeiros que permita interpretar diferentes layouts, transformar registros para um modelo canônico e publicar as operações no Amazon SQS com segurança, rastreabilidade e mecanismos de recuperação.
+Implementar um consumidor desacoplado e escalável que permita persistir operações financeiras recebidas pelo Amazon SQS, assegurando consistência transacional, idempotência, rastreabilidade e capacidade de recuperação.
 
-A solução deverá garantir que falhas de publicação sejam identificadas e tratadas, evitando perda silenciosa de operações.
+ARQUITETURA
 
-ARQUITETURA PROPOSTA
+Fluxo de responsabilidade desta história:
 
-Fluxo de ingestão:
+AWS Batch
+→ Amazon SQS de ingestão
+→ AWS Lambda .NET
+→ Validação da mensagem
+→ Verificação de idempotência
+→ DynamoDB TransactWriteItems
+→ OPERACOES + REGISTROS_CLEARING
 
-Amazon S3
-→ Evento de criação do arquivo
-→ EventBridge / mecanismo de orquestração
-→ AWS Batch
-→ Leitura streaming do CSV
-→ Parser específico do layout
-→ Adaptador do produto
-→ Validação da operação
-→ Modelo canônico
-→ Publicação em lote no Amazon SQS
+Fluxo posterior, fora do escopo:
 
-Fluxo posterior, fora do escopo desta história:
-
-Amazon SQS de ingestão
-→ Lambda ou serviço consumidor
-→ Validação de idempotência
-→ DynamoDB OPERACOES
-→ DynamoDB REGISTROS_CLEARING
-→ DynamoDB Streams
+DynamoDB Streams de OPERACOES
 → EventBridge Pipes
-→ SQS de registro
-→ Worker de integração com a clearing
+→ SQS de registro por clearing
+→ Worker de registro
+→ API externa da clearing
 
-A fila de ingestão deverá ser distinta da fila utilizada para o envio de operações às clearings.
+A fila de ingestão deverá ser distinta das filas de integração com as clearings.
 
 ESCOPO FUNCIONAL
 
-1. RECEBIMENTO E IDENTIFICAÇÃO DOS ARQUIVOS
+1. INTEGRAÇÃO COM O AMAZON SQS
 
-O processo deverá ser iniciado a partir da disponibilização de um arquivo CSV em um bucket S3 previamente configurado.
+Implementar uma AWS Lambda acionada por eventos de uma fila SQS destinada à ingestão de operações financeiras.
 
-O evento de criação do objeto deverá acionar o mecanismo de orquestração responsável por iniciar o job do AWS Batch.
+A Lambda deverá utilizar Event Source Mapping para receber lotes de mensagens.
 
-O job deverá receber, no mínimo:
+A quantidade de mensagens por lote deverá ser configurável, respeitando os limites suportados pelo serviço.
 
-- Bucket de origem.
-- Chave do objeto no S3.
-- Identificador único do arquivo.
-- Tipo de produto financeiro.
-- Versão do layout.
-- Data de referência do processamento.
-- Identificador de correlação da execução.
+O consumidor deverá processar cada mensagem de forma independente, garantindo que uma falha isolada não obrigue o reprocessamento de mensagens concluídas com sucesso.
 
-O identificador do arquivo deverá permitir reconhecer reprocessamentos e relacionar as operações à sua origem.
+A integração deverá utilizar a funcionalidade ReportBatchItemFailures para informar ao serviço quais mensagens não foram processadas com sucesso.
 
-A identificação do objeto deverá considerar mecanismos que permitam distinguir versões diferentes de um arquivo quando necessário.
+As mensagens processadas com sucesso deverão ser removidas da fila pelo mecanismo gerenciado de integração SQS/Lambda.
 
-O sistema deverá validar a existência e a acessibilidade do arquivo antes de iniciar sua leitura.
+O código da aplicação não deverá executar exclusão manual das mensagens, salvo decisão arquitetural específica.
 
-Arquivos inexistentes, inacessíveis, vazios ou com layout incompatível deverão gerar falha controlada.
+A solução deverá considerar a semântica de entrega pelo menos uma vez do SQS Standard.
 
-2. LEITURA EFICIENTE DO CSV
+Não deverá existir dependência de ordenação global das mensagens.
 
-A leitura deverá ocorrer em streaming, evitando carregar todo o arquivo em memória.
+2. CONTRATO DAS MENSAGENS
 
-O processo deverá suportar arquivos contendo aproximadamente 2 a 3 milhões de registros e permitir crescimento futuro da volumetria.
+O consumidor deverá receber mensagens compatíveis com o modelo canônico definido para a plataforma.
 
-A implementação deverá utilizar um parser CSV compatível com o layout recebido, respeitando corretamente delimitadores, cabeçalhos, campos opcionais, campos entre aspas, caracteres especiais e codificação.
+Cada mensagem deverá conter, no mínimo:
 
-A leitura deverá ser incremental.
+idOperacao.
 
-O processamento não poderá depender do carregamento integral do arquivo em memória.
+produto.
 
-Deverão ser identificadas e tratadas situações como:
+tipoOperacao.
 
-- Arquivo sem cabeçalho obrigatório.
-- Colunas ausentes.
-- Quantidade inválida de colunas.
-- Campos obrigatórios vazios.
-- Valores numéricos inválidos.
-- Datas inválidas.
-- Linhas malformadas.
-- Codificação incompatível.
-- Arquivo interrompido ou corrompido.
+clearingDestino.
 
-Erros isolados de conteúdo não deverão necessariamente interromper o processamento completo, desde que seja possível identificar e isolar a linha inválida.
+chaveIdempotencia.
 
-Erros estruturais que impeçam a interpretação confiável do arquivo deverão interromper o processamento.
+versaoModelo.
 
-3. ARQUITETURA DE ADAPTADORES POR PRODUTO
+origem.
 
-A implementação deverá separar a leitura física do arquivo da interpretação de negócio dos registros.
+dataHoraInclusao.
 
-O fluxo principal do AWS Batch não deverá conter regras específicas de RDB, CDB ou de qualquer outro produto financeiro.
+dadosOperacao.
 
-Deverá existir um mecanismo de resolução de adaptadores com base no produto e na versão do layout.
+A estrutura origem deverá permitir identificar o sistema ou arquivo responsável pela geração da operação.
 
-Cada adaptador será responsável por interpretar os campos específicos do produto e transformá-los para o modelo canônico.
+Exemplo:
 
-Inicialmente, deverá ser implementado o adaptador para RDB.
+origem.tipo = ARQUIVO
 
-A arquitetura deverá permitir a inclusão posterior de adaptadores para CDB e outros produtos, sem necessidade de alterar o mecanismo principal de leitura ou publicação.
+origem.identificador = ARQ-20261021-001
 
-Responsabilidades sugeridas:
+O consumidor deverá ser preparado para receber futuramente operações provenientes de outros mecanismos de ingestão, como Kafka, desde que utilizem o contrato canônico homologado.
 
-Parser: interpreta a estrutura física do CSV e produz um registro de entrada.
+O contrato deverá possuir versionamento explícito.
 
-Adapter: transforma o registro específico do produto em uma operação canônica.
+Mensagens com versões não suportadas deverão ser rejeitadas de forma controlada.
 
-Validator: valida as regras estruturais e de negócio aplicáveis à operação.
+3. VALIDAÇÃO DAS MENSAGENS
 
-SqsPublisher: publica as operações canônicas no Amazon SQS.
+Antes da persistência, o consumidor deverá validar a estrutura da mensagem.
 
-ProcessingCoordinator: controla leitura, concorrência, contabilização, publicação e tratamento de falhas.
+Deverão ser realizadas validações como:
 
-4. MODELO CANÔNICO
-
-Toda operação válida deverá ser convertida para o modelo canônico definido para a plataforma.
-
-O modelo deverá conter, no mínimo:
-
-idOperacao: identificador único da operação.
-
-produto: identificação do produto financeiro, inicialmente RDB.
-
-tipoOperacao: APLICACAO ou RESGATE.
-
-clearingDestino: identificação da clearing responsável pelo registro.
-
-chaveIdempotencia: identificador determinístico utilizado para prevenir processamento duplicado.
-
-versaoModelo: versão do contrato canônico.
-
-origem: estrutura contendo o tipo da origem e o identificador do arquivo.
-
-dataHoraInclusao: data e hora de criação da operação no contexto da ingestão.
-
-dadosOperacao: estrutura flexível contendo os atributos específicos do produto.
-
-O contrato da mensagem deverá incluir os metadados necessários para rastreabilidade e correlação.
-
-A operação deverá possuir apenas uma clearing de destino.
-
-O modelo deverá ser versionado para permitir evolução sem quebra de compatibilidade com consumidores existentes.
-
-O Batch deverá produzir mensagens compatíveis com o contrato esperado pelo consumidor da fila.
-
-5. VALIDAÇÃO DAS OPERAÇÕES
-
-As validações deverão ocorrer antes da publicação no SQS.
-
-Deverão existir validações estruturais comuns a todos os produtos e validações específicas implementadas pelo respectivo adaptador ou validador.
-
-As validações comuns deverão contemplar, quando aplicáveis:
-
-- Presença de identificadores obrigatórios.
+- JSON válido.
+- Campos obrigatórios presentes.
+- Identificadores válidos.
 - Produto reconhecido.
 - Tipo de operação permitido.
-- Clearing de destino informada e suportada.
-- Datas em formato válido.
-- Valores monetários em formato válido.
-- Identificação da origem.
-- Versão do modelo suportada.
-- Chave de idempotência válida.
+- Clearing de destino suportada.
+- Versão do modelo compatível.
+- Estrutura de dadosOperacao válida.
+- Chave de idempotência presente.
+- Tamanho dos dados compatível com os limites do DynamoDB.
 
-As validações específicas de RDB deverão ser definidas conforme o contrato de entrada homologado com a área de negócio.
+O consumidor não deverá repetir integralmente todas as validações financeiras executadas pelo AWS Batch.
 
-O sistema não deverá presumir regras financeiras que não tenham sido formalmente aprovadas.
+Entretanto, deverá validar as invariantes necessárias para proteger a integridade do banco de dados.
 
-Registros inválidos não deverão ser publicados na fila de ingestão.
+O consumidor não deverá confiar cegamente na origem da mensagem.
 
-Esses registros deverão ser contabilizados e associados a um motivo de rejeição.
+Mensagens inválidas deverão ser classificadas como falhas permanentes, evitando tentativas infinitas.
 
-O processo deverá permitir distinguir erros de validação, erros de transformação e falhas técnicas de publicação.
+4. MAPEAMENTO PARA O DYNAMODB
 
-6. IDENTIFICAÇÃO E IDEMPOTÊNCIA
+O consumidor deverá converter a mensagem recebida para as estruturas persistidas nas tabelas DynamoDB.
 
-O processo deverá ser seguro para reexecução.
+Tabela OPERACOES
 
-O reprocessamento de um arquivo poderá resultar na republicação de mensagens já enviadas anteriormente, especialmente em cenários de falha parcial ou interrupção do job.
+Chave primária:
 
-Por esse motivo, cada operação deverá possuir uma chave de idempotência estável e determinística, conforme as regras de identificação de negócio.
+PK: idOperacao
 
-A chave deverá permanecer igual para a mesma operação, independentemente da execução do Batch.
+Atributos:
 
-O identificador de execução não deverá compor a identidade de negócio de maneira que gere uma nova chave a cada reprocessamento.
+idOperacao.
 
-O AWS Batch não deverá depender de consultas ao DynamoDB para verificar a existência prévia da operação.
+produto.
 
-A deduplicação definitiva deverá ser realizada pelo consumidor responsável pela persistência.
+tipoOperacao.
 
-A solução deverá assumir que mensagens podem ser entregues mais de uma vez pelo SQS.
+clearingDestino.
 
-Caso seja utilizada uma fila SQS Standard, não haverá garantia de ordenação global ou de entrega exatamente uma vez.
+chaveIdempotencia.
 
-A estratégia de idempotência deverá considerar explicitamente essas características.
+versaoModelo.
 
-7. PUBLICAÇÃO NO AMAZON SQS
+origem.
 
-O AWS Batch deverá publicar as operações canônicas em uma fila Amazon SQS específica para ingestão.
+dataHoraInclusao.
 
-A publicação deverá utilizar o AWS SDK for .NET.
+dataHoraAlteracao.
 
-Deverá ser priorizado o uso de SendMessageBatch para reduzir a quantidade de chamadas à API e melhorar a eficiência.
+dadosOperacao.
 
-Cada chamada SendMessageBatch poderá conter até dez mensagens, respeitando os limites de tamanho da operação e das mensagens.
+Tabela REGISTROS_CLEARING
 
-A implementação deverá validar o tamanho do payload antes da publicação.
+Chave primária:
 
-O processo não deverá tentar publicar mensagens acima do limite permitido pelo SQS.
+PK: idOperacao
 
-A estrutura da mensagem deverá conter os dados canônicos necessários para a persistência posterior, evitando a necessidade de o consumidor reler o CSV original.
+Atributos:
 
-Metadados de correlação poderão ser transmitidos por atributos de mensagem ou pelo envelope, respeitando os limites do serviço.
+idOperacao.
 
-O publisher deverá tratar individualmente o resultado de cada mensagem enviada em lote.
+idRegistro.
 
-Uma resposta HTTP de sucesso para SendMessageBatch não significa necessariamente que todas as mensagens do lote foram aceitas.
+clearing.
 
-A implementação deverá verificar as coleções de mensagens aceitas e rejeitadas retornadas pela API.
+status.
 
-Somente mensagens confirmadas como aceitas poderão ser contabilizadas como publicadas.
+tentativa.
 
-Mensagens rejeitadas deverão ser submetidas à política de retry ou registradas como falha definitiva.
+versaoModelo.
 
-8. CONTROLE DE CONCORRÊNCIA E THROUGHPUT
+dataHoraInclusao.
 
-O processo deverá permitir configuração do número máximo de operações em transformação e publicação simultânea.
+dataHoraAlteracao.
 
-A implementação deverá utilizar concorrência controlada e buffers com capacidade limitada.
+dadosRegistro.
 
-O processamento não poderá acumular milhões de objetos em memória enquanto aguarda a publicação.
+O registro inicial de clearing deverá possuir:
 
-O número de workers, o tamanho dos lotes, a quantidade de requisições concorrentes e os limites de processamento deverão ser configuráveis por ambiente.
+status = PENDENTE
 
-O processo deverá aplicar backpressure quando houver aumento de latência, throttling ou falhas na publicação para o SQS.
+tentativa = 0
 
-Deverão ser implementadas tentativas com exponential backoff e jitter para falhas transitórias.
+clearing = clearingDestino da operação.
 
-O objetivo de throughput deverá ser validado em testes de carga com 2 e 3 milhões de operações.
+O idRegistro deverá ser gerado de maneira consistente com a estratégia de identificação adotada pelo projeto.
 
-Como referência, publicar 3 milhões de mensagens em duas horas exige uma média aproximada de 417 mensagens por segundo.
+O campo idExterno não será obrigatório no momento da criação.
 
-Com lotes completos de dez mensagens, isso representa aproximadamente 42 chamadas SendMessageBatch por segundo, desconsiderando retries e mensagens rejeitadas.
+Os timestamps de inclusão deverão seguir uma convenção padronizada, preferencialmente UTC.
 
-A capacidade do consumidor e o crescimento do backlog da fila deverão ser avaliados em conjunto com a taxa de publicação.
+5. PERSISTÊNCIA TRANSACIONAL
 
-O Batch não deverá assumir que a aceitação das mensagens pelo SQS significa que o processamento completo da operação foi concluído.
+A criação da operação e do registro inicial de clearing deverá ocorrer de maneira atômica.
 
-9. TRATAMENTO DE FALHAS NA PUBLICAÇÃO
+O consumidor deverá utilizar TransactWriteItems do DynamoDB.
 
-O processo deverá distinguir:
+A transação deverá conter, no mínimo:
 
-Falhas de leitura do S3.
+PutItem na tabela OPERACOES.
 
-Falhas estruturais do arquivo.
+PutItem na tabela REGISTROS_CLEARING.
 
-Falhas de validação.
+Ambas as gravações deverão utilizar condições de inexistência dos respectivos itens.
 
-Falhas de transformação para o modelo canônico.
+Exemplo conceitual:
 
-Falhas transitórias do SQS.
+Put OPERACOES
+ConditionExpression: attribute_not_exists(idOperacao)
 
-Rejeições individuais em SendMessageBatch.
+Put REGISTROS_CLEARING
+ConditionExpression: attribute_not_exists(idOperacao)
 
-Falhas permanentes de publicação.
+O consumidor não deverá utilizar duas chamadas PutItem independentes para criar os registros.
 
-Falhas de infraestrutura ou interrupção do job.
+A transação deverá assegurar que ambos os registros sejam criados ou que nenhum deles seja criado.
 
-Falhas transitórias deverão ser submetidas a tentativas controladas.
+Falhas de transação deverão ser identificadas e classificadas.
 
-Não deverão existir retries indefinidos.
+O consumidor deverá distinguir conflitos de idempotência de erros transitórios do DynamoDB.
 
-A implementação deverá considerar que uma chamada pode ter sido aceita pelo SQS mesmo quando o cliente não recebeu a confirmação devido a uma falha de comunicação.
+6. CONTROLE DE IDEMPOTÊNCIA
 
-Nesses casos, a repetição da publicação poderá produzir mensagens duplicadas.
+O processamento deverá ser idempotente.
 
-A recuperação deverá preservar a chave de idempotência original.
+O SQS poderá entregar a mesma mensagem mais de uma vez.
 
-Falhas permanentes de publicação não poderão ser contabilizadas como sucesso.
+O AWS Batch também poderá republicar operações durante reprocessamentos de arquivos.
 
-O job deverá finalizar com falha ou estado de execução parcialmente concluída, conforme a política formalmente definida, caso existam operações válidas que não tenham sido publicadas após as tentativas permitidas.
+A solução deverá impedir que essas situações criem registros duplicados.
 
-10. REPROCESSAMENTO E RECUPERAÇÃO
+A estratégia principal deverá utilizar um identificador estável de operação, associado à identidade de negócio.
 
-O processo deverá permitir reprocessamento integral do arquivo.
+A chave idOperacao deverá ser determinística ou possuir correspondência unívoca com a chaveIdempotencia.
 
-O reprocessamento deverá utilizar as mesmas regras de identificação e transformação aplicadas à execução original.
+A implementação deverá garantir que duas mensagens representando a mesma operação de negócio não possam gerar identificadores diferentes e, consequentemente, registros duplicados.
 
-Operações já publicadas poderão ser republicadas.
+A existência de um GSI por chaveIdempotencia não deverá ser considerada suficiente para garantir unicidade.
 
-A solução deverá depender da idempotência do consumidor para impedir persistência duplicada e registros financeiros duplicados.
+As condições de gravação deverão ser avaliadas atomicamente.
 
-Deverá existir mecanismo para identificar a execução original e suas tentativas posteriores.
+Quando uma operação já existir, o consumidor deverá verificar se o registro existente corresponde à mesma identidade e ao mesmo conteúdo de negócio esperado.
 
-A necessidade de checkpoints por linha ou por bloco deverá ser avaliada durante a POC.
+Se a mensagem representar uma repetição legítima de uma operação já persistida, deverá ser tratada como duplicidade idempotente.
 
-Não deverá ser implementado um mecanismo complexo de checkpoint sem evidência de necessidade.
+Nesse caso, a mensagem poderá ser considerada processada com sucesso, sem sobrescrever os registros existentes.
 
-O processo deverá permitir recuperação após falhas ocorridas depois da publicação parcial do arquivo.
+Caso exista divergência de conteúdo para a mesma identidade, o consumidor deverá classificar a ocorrência como conflito de idempotência.
 
-11. RASTREABILIDADE DO ARQUIVO
+Conflitos não deverão ser tratados automaticamente como sucesso.
 
-Cada execução deverá possuir um identificador único.
+7. CONTROLE DE CONCORRÊNCIA
 
-O processamento deverá registrar, no mínimo:
+O consumidor deverá suportar múltiplas execuções simultâneas.
 
-Identificador da execução.
+A concorrência da Lambda deverá ser configurável por ambiente.
 
-Identificador do arquivo.
+O processamento deverá considerar o throughput de gravação do DynamoDB e a capacidade de consumo da fila.
 
-Bucket e chave do objeto.
+A solução deverá evitar concorrência descontrolada que provoque throttling excessivo.
 
-Produto.
+Deverão ser avaliados:
 
-Versão do layout.
+- Batch size do Event Source Mapping.
+- Quantidade máxima de instâncias concorrentes.
+- Tempo médio de processamento.
+- Capacidade de escrita do DynamoDB.
+- Latência das transações.
+- Quantidade de mensagens acumuladas na fila.
 
-Data de referência.
+A solução deverá permitir ajuste de concorrência sem necessidade de alteração do código.
 
-Horário de início.
+8. TRATAMENTO DE FALHAS
 
-Horário de término.
+As falhas deverão ser classificadas em transitórias e permanentes.
 
-Quantidade total de linhas lidas.
+Falhas transitórias:
 
-Quantidade de operações válidas.
+Throttling do DynamoDB.
 
-Quantidade de operações publicadas com confirmação de aceite pelo SQS.
+Timeout.
 
-Quantidade de registros rejeitados por validação.
+Falhas temporárias de comunicação.
 
-Quantidade de falhas de transformação.
+Indisponibilidade temporária de serviços AWS.
 
-Quantidade de falhas de publicação.
+Conflitos transacionais transitórios.
 
-Quantidade de mensagens submetidas a retry.
+Falhas permanentes:
 
-Quantidade de operações não publicadas após esgotamento das tentativas.
+Mensagem JSON inválida.
 
-Status final da execução.
+Campos obrigatórios ausentes.
 
-Os totais deverão permitir conciliação entre o conteúdo do arquivo e o resultado da publicação.
+Versão de contrato não suportada.
 
-12. RELATÓRIO DE PROCESSAMENTO
+Produto ou clearing inválidos.
 
-Ao final de cada execução, deverá ser produzido um relatório contendo o resultado da ingestão.
+Payload incompatível com o modelo.
 
-O relatório deverá apresentar os totais de linhas processadas, operações válidas, mensagens publicadas, rejeições e falhas técnicas.
+Conflito definitivo de idempotência.
 
-As inconsistências deverão possuir informações suficientes para identificação da linha e da causa do problema.
+Falhas transitórias deverão utilizar retries controlados com exponential backoff e jitter, respeitando o tempo disponível da execução Lambda.
 
-O armazenamento de arquivos de rejeição no S3 poderá ser utilizado conforme política de segurança e retenção definida pelo projeto.
+Caso a operação não seja concluída, a mensagem deverá ser devolvida ao fluxo de reprocessamento do SQS por meio do retorno de falha parcial.
 
-O relatório deverá distinguir claramente:
+Falhas permanentes deverão seguir uma política explícita de quarentena ou encaminhamento para análise.
 
-Operação publicada no SQS.
+O consumidor não deverá simplesmente descartar mensagens inválidas.
 
-Operação persistida no DynamoDB.
+A fila deverá possuir uma Dead Letter Queue configurada com política de redrive.
 
-Operação enviada à clearing.
+Mensagens que excederem o número máximo de tentativas deverão ser encaminhadas à DLQ.
 
-Operação registrada na clearing.
+A implementação deverá garantir que uma mensagem inválida não provoque reprocessamento indefinido.
 
-Esta história será responsável apenas pela confirmação da primeira etapa.
+9. PROCESSAMENTO PARCIAL DE LOTES
 
-Os demais estados pertencem aos componentes posteriores do fluxo.
+O consumidor deverá utilizar ReportBatchItemFailures.
+
+Cada mensagem deverá possuir resultado independente.
+
+Quando uma mensagem falhar, seu identificador deverá ser incluído na resposta de falha parcial.
+
+As mensagens processadas com sucesso não deverão ser incluídas nessa resposta.
+
+A implementação deverá tratar adequadamente exceções individuais, evitando que uma falha inesperada cause o retorno de sucesso para mensagens não processadas.
+
+O processamento deverá garantir que uma mensagem só seja considerada bem-sucedida após confirmação da persistência transacional ou identificação comprovada de duplicidade legítima.
+
+10. INTEGRAÇÃO COM DYNAMODB STREAMS
+
+A criação de um novo item na tabela OPERACOES deverá produzir um evento no DynamoDB Streams, conforme a configuração definida na infraestrutura.
+
+O consumidor não deverá publicar diretamente mensagens na fila de registro da clearing.
+
+A responsabilidade de encaminhamento para as filas de registro continuará pertencendo ao fluxo DynamoDB Streams → EventBridge Pipes → SQS.
+
+A implementação deverá evitar que duplicidades idempotentes gerem novas gravações na tabela OPERACOES e, consequentemente, novos eventos de criação.
+
+O processamento posterior deverá considerar que eventos de Streams podem ser entregues mais de uma vez.
+
+Também deverá considerar que a disponibilidade do snapshot de REGISTROS_CLEARING para outros consumidores precisa ser tratada corretamente, mesmo quando os registros forem criados na mesma transação.
+
+11. HISTÓRICO INICIAL
+
+Deverá ser confirmada a regra de negócio para criação do evento histórico inicial.
+
+Caso a plataforma exija um evento de criação na tabela EVENTOS_REGISTRO, esse evento deverá ser persistido na mesma transação que cria a operação e o registro inicial.
+
+Nesse cenário, a transação passará a conter três gravações:
+
+Put OPERACOES.
+
+Put REGISTROS_CLEARING.
+
+Put EVENTOS_REGISTRO.
+
+O evento inicial deverá possuir identificador único e tipo de evento padronizado.
+
+A regra deverá ser única para todos os produtos e clearings.
+
+Não deverá existir duplicidade de eventos históricos em reprocessamentos idempotentes.
+
+12. RASTREABILIDADE
+
+Cada mensagem deverá permitir identificar:
+
+idOperacao.
+
+chaveIdempotencia.
+
+produto.
+
+clearingDestino.
+
+Arquivo ou sistema de origem.
+
+Identificador de correlação.
+
+Identificador da mensagem SQS.
+
+Horário de recebimento.
+
+Resultado do processamento.
+
+O consumidor deverá produzir informações suficientes para rastrear uma operação desde a publicação no SQS até sua persistência no DynamoDB.
 
 13. OBSERVABILIDADE
 
 A solução deverá disponibilizar logs estruturados e métricas operacionais.
 
-Os logs deverão conter identificadores de correlação, arquivo, execução e operação, quando aplicável.
+Deverão ser monitorados:
 
-Deverão ser disponibilizadas métricas para:
+Mensagens recebidas.
 
-Linhas lidas por segundo.
+Mensagens persistidas.
 
-Operações transformadas por segundo.
+Duplicidades identificadas.
 
-Mensagens publicadas por segundo.
+Conflitos de idempotência.
 
-Quantidade de chamadas SendMessageBatch.
+Mensagens inválidas.
 
-Quantidade de mensagens por lote.
+Falhas transitórias.
 
-Tempo médio e percentis de publicação.
+Falhas permanentes.
 
-Quantidade de mensagens rejeitadas.
+Tentativas de retry.
 
-Quantidade de retries.
+Tempo médio de processamento.
 
-Throttling do SQS.
+Latência das transações DynamoDB.
 
-Tempo total de execução.
+ConsumedCapacity das operações de escrita.
 
-Utilização de CPU e memória do job.
+Throttling do DynamoDB.
 
-Deverá ser possível correlacionar uma execução do Batch com as mensagens publicadas.
+Quantidade de mensagens na fila.
 
-A solução deverá permitir integração com as ferramentas de observabilidade adotadas pela empresa.
+Idade da mensagem mais antiga.
 
-Não deverão ser gerados logs individuais de sucesso para cada operação em nível INFO, salvo necessidade justificada, evitando custos elevados de observabilidade.
+Mensagens encaminhadas à DLQ.
+
+Quantidade de execuções concorrentes da Lambda.
+
+Duração e erros da Lambda.
+
+Os logs deverão conter identificadores de correlação.
+
+Dados financeiros sensíveis não deverão ser registrados indiscriminadamente.
+
+Deverão ser disponibilizados indicadores para identificar crescimento anormal do backlog e interrupções no processamento.
 
 14. SEGURANÇA
 
-O job deverá utilizar IAM Role com princípio do menor privilégio.
+A Lambda deverá utilizar IAM Role com princípio do menor privilégio.
 
-As permissões deverão limitar o acesso ao bucket S3 de origem e à fila SQS de ingestão.
+As permissões deverão contemplar:
 
-O AWS Batch não deverá receber permissões de escrita no DynamoDB, salvo outra necessidade explicitamente aprovada e fora deste escopo.
+Leitura das mensagens da fila SQS.
 
-Não deverão existir credenciais AWS fixas no código ou na imagem Docker.
+Exclusão das mensagens pelo mecanismo de integração.
 
-A comunicação com os serviços AWS deverá utilizar conexões seguras.
+Escrita nas tabelas DynamoDB necessárias.
 
-A configuração deverá ser fornecida por variáveis de ambiente, parâmetros gerenciados ou mecanismos equivalentes.
+Leitura pontual para verificação de idempotência.
 
-A solução deverá respeitar as políticas de criptografia, proteção de dados e retenção estabelecidas pela empresa.
+Publicação de logs e métricas.
+
+A Lambda não deverá possuir permissões de acesso às APIs das clearings.
+
+Não deverão existir credenciais AWS fixas no código.
+
+A comunicação com os serviços deverá utilizar conexões seguras.
+
+A solução deverá respeitar as políticas de criptografia, segurança e proteção de dados da empresa.
 
 15. INFRAESTRUTURA AWS
 
 A infraestrutura deverá contemplar:
 
-Definição do AWS Batch Job Definition.
+AWS Lambda .NET.
 
-Ambiente computacional adequado à execução do contêiner.
+Event Source Mapping SQS/Lambda.
 
-Fila de jobs do AWS Batch.
+Fila SQS de ingestão.
 
-Imagem Docker armazenada no Amazon ECR.
+Dead Letter Queue.
 
-IAM Roles e políticas necessárias.
+Política de redrive.
 
-Integração com o bucket S3 de entrada.
+IAM Role e políticas.
 
-Mecanismo de acionamento a partir do evento de criação do objeto.
+Configuração de memória e timeout.
 
-Fila SQS de ingestão de operações.
+Configuração de concorrência.
 
-Configuração de logs.
+Configuração de batch size.
 
-Parâmetros de CPU, memória, concorrência, timeout e retries.
+Habilitação de ReportBatchItemFailures.
 
-Configurações de rede necessárias ao acesso ao S3 e SQS.
+Configuração de logs e métricas.
 
-A fila deverá possuir política de retenção compatível com o tempo máximo esperado de indisponibilidade dos consumidores e com a estratégia de recuperação.
+Permissões de acesso às tabelas DynamoDB.
 
-A necessidade de uma DLQ para a fila de ingestão deverá ser tratada na história do consumidor, incluindo política de redrive.
-
-A infraestrutura definitiva deverá ser implementada por Terraform, seguindo os padrões adotados pela empresa.
+A infraestrutura deverá ser provisionada por Terraform, seguindo os padrões adotados pela empresa.
 
 16. TESTES
 
-Deverão ser realizados testes unitários, de integração e de carga.
+Deverão ser implementados testes unitários, de integração e de carga.
 
-Os testes deverão contemplar:
+Cenários obrigatórios:
 
-Leitura de CSV válido.
+Recebimento de mensagem válida.
 
-Leitura de arquivo vazio.
+Desserialização do modelo canônico.
 
-Layout inválido.
+Mensagem JSON inválida.
 
-Campos obrigatórios ausentes.
+Campo obrigatório ausente.
 
-Valores monetários inválidos.
+Versão de contrato não suportada.
 
-Datas inválidas.
+Produto inválido.
 
-Produto não suportado.
+Clearing inválida.
 
-Transformação correta de RDB.
+Persistência transacional bem-sucedida.
 
-Geração do modelo canônico.
+Falha na criação de OPERACOES.
 
-Geração estável da chave de idempotência.
+Falha na criação de REGISTROS_CLEARING.
 
-Publicação de mensagem válida no SQS.
+Rollback transacional.
 
-Publicação em lote com até dez mensagens.
+Mensagem duplicada.
 
-Falha parcial de SendMessageBatch.
+Mensagens duplicadas processadas simultaneamente.
 
-Throttling do SQS.
+Conflito de idempotência.
 
-Timeout na publicação.
+Falha temporária do DynamoDB.
 
-Retry com backoff.
+Throttling.
 
-Reprocessamento integral do arquivo.
+Timeout.
 
-Interrupção do Batch após publicação parcial.
+Retry.
 
-Consumo de memória durante processamento de arquivos grandes.
+Falha parcial de lote SQS.
 
-Teste de publicação de 2 milhões de operações.
+Encaminhamento para DLQ.
 
-Teste de publicação de 3 milhões de operações.
+Reprocessamento de mensagem após falha.
+
+Verificação de que duplicidades não produzem novas gravações.
+
+Verificação da geração de eventos DynamoDB Streams para novas operações.
+
+Teste de carga com 2 milhões de operações.
+
+Teste de carga com 3 milhões de operações.
 
 17. FORA DO ESCOPO
 
 Não fazem parte desta história:
 
-Persistência direta das operações no DynamoDB.
+Leitura de arquivos CSV.
 
-Implementação do consumidor SQS responsável por criar OPERACOES e REGISTROS_CLEARING.
+Execução do AWS Batch.
 
-Criação ou atualização de EVENTOS_REGISTRO.
+Transformação de layouts específicos para o modelo canônico.
 
-Envio das operações para a clearing.
+Publicação inicial das mensagens no SQS.
+
+Implementação das tabelas DynamoDB, caso já contemplada pela H03.
+
+Implementação do EventBridge Pipes.
+
+Implementação das filas de registro por clearing.
+
+Envio das operações para a B3.
 
 Processamento de retornos da clearing.
 
-Atualização posterior de status de registro.
+Conciliação financeira.
 
-Conciliação financeira com a clearing.
-
-Implementação da futura ingestão via Kafka.
-
-Consultas operacionais e relatórios sobre as operações persistidas.
+Consultas do portal operacional.
 
 CRITÉRIOS DE ACEITE
 
-CA01 - O AWS Batch deverá ser iniciado a partir de um arquivo disponibilizado no S3, por meio do mecanismo de orquestração definido.
+CA01 - A Lambda deverá ser acionada automaticamente por mensagens da fila SQS de ingestão.
 
-CA02 - O job deverá receber os parâmetros necessários para identificar arquivo, produto, versão de layout e execução.
+CA02 - A solução deverá utilizar .NET 8 ou versão homologada pelo projeto.
 
-CA03 - A leitura do arquivo deverá ocorrer em streaming, sem carregamento integral em memória.
+CA03 - O consumidor deverá receber mensagens compatíveis com o modelo canônico.
 
-CA04 - A solução deverá processar corretamente arquivos CSV válidos do produto RDB.
+CA04 - O contrato deverá possuir versão explícita.
 
-CA05 - O parser deverá identificar arquivos estruturalmente inválidos e produzir diagnóstico apropriado.
+CA05 - Mensagens inválidas deverão ser identificadas e rejeitadas de maneira controlada.
 
-CA06 - O fluxo principal de ingestão deverá ser independente das regras específicas de cada produto financeiro.
+CA06 - O consumidor deverá validar os campos obrigatórios e as invariantes necessárias para persistência.
 
-CA07 - A implementação deverá utilizar adaptadores para transformação dos registros de entrada em operações canônicas.
+CA07 - O consumidor deverá mapear corretamente a mensagem para a tabela OPERACOES.
 
-CA08 - A inclusão futura de novos adaptadores não deverá exigir alteração do fluxo principal de leitura e publicação.
+CA08 - O consumidor deverá criar o snapshot inicial na tabela REGISTROS_CLEARING.
 
-CA09 - Toda operação válida deverá ser transformada para o contrato canônico homologado.
+CA09 - O status inicial do registro deverá ser PENDENTE.
 
-CA10 - O contrato canônico deverá conter produto, tipo de operação, clearing de destino, identificadores, origem, versão e dados específicos.
+CA10 - O número inicial de tentativas deverá ser zero.
 
-CA11 - O contrato deverá possuir mecanismo explícito de versionamento.
+CA11 - A criação dos registros deverá utilizar TransactWriteItems.
 
-CA12 - As validações comuns e específicas do produto deverão ocorrer antes da publicação.
+CA12 - A criação da operação e do registro inicial deverá ser atômica.
 
-CA13 - Registros inválidos não deverão ser publicados na fila SQS de ingestão.
+CA13 - A transação deverá utilizar condições de inexistência para impedir sobrescritas indevidas.
 
-CA14 - Registros rejeitados deverão ser contabilizados e possuir motivo identificável.
+CA14 - A solução deverá impedir duplicidades de operações financeiras durante reprocessamentos.
 
-CA15 - O AWS Batch deverá publicar as operações canônicas em uma fila Amazon SQS específica para ingestão.
+CA15 - A implementação não deverá depender exclusivamente de GSI para garantir unicidade.
 
-CA16 - O AWS Batch não deverá realizar persistência direta nas tabelas DynamoDB.
+CA16 - Mensagens duplicadas legítimas deverão ser tratadas como processamento idempotente.
 
-CA17 - A publicação deverá utilizar o AWS SDK for .NET.
+CA17 - Conflitos de identidade ou conteúdo deverão ser identificados e não poderão ser tratados como duplicidades legítimas.
 
-CA18 - A solução deverá suportar publicação em lotes por SendMessageBatch.
+CA18 - O consumidor deverá suportar processamento concorrente de mensagens.
 
-CA19 - O publisher deverá respeitar os limites de quantidade e tamanho de mensagens estabelecidos pelo SQS.
+CA19 - A concorrência deverá ser configurável por ambiente.
 
-CA20 - O publisher deverá verificar individualmente o resultado das mensagens em SendMessageBatch.
+CA20 - O processamento deverá utilizar retries controlados para falhas transitórias.
 
-CA21 - Mensagens rejeitadas em um lote não poderão ser contabilizadas como publicadas.
+CA21 - A implementação deverá diferenciar falhas transitórias de falhas permanentes.
 
-CA22 - Falhas transitórias deverão utilizar retries controlados com exponential backoff e jitter.
+CA22 - A integração SQS/Lambda deverá utilizar ReportBatchItemFailures.
 
-CA23 - O processo deverá possuir limite configurável de tentativas de publicação.
+CA23 - Uma falha individual não deverá provocar reprocessamento desnecessário das demais mensagens do lote.
 
-CA24 - Falhas definitivas de publicação deverão ser registradas e refletidas no resultado da execução.
+CA24 - Mensagens somente poderão ser consideradas bem-sucedidas após confirmação da transação ou comprovação de duplicidade legítima.
 
-CA25 - A solução deverá permitir configurar a concorrência e o tamanho dos lotes de publicação.
+CA25 - A fila deverá possuir DLQ configurada.
 
-CA26 - A implementação deverá utilizar buffers limitados e mecanismos de backpressure para evitar consumo excessivo de memória.
+CA26 - Mensagens que excederem a política de tentativas deverão ser encaminhadas à DLQ.
 
-CA27 - A chave de idempotência de uma operação deverá permanecer estável entre execuções e reprocessamentos do arquivo.
+CA27 - Mensagens inválidas não poderão ser descartadas silenciosamente.
 
-CA28 - O reprocessamento de um arquivo deverá ser suportado sem alteração indevida da identidade de negócio das operações.
+CA28 - A criação de novas operações deverá produzir eventos no DynamoDB Streams.
 
-CA29 - A solução deverá admitir a possibilidade de mensagens duplicadas, sem assumir garantia de entrega exatamente uma vez pelo SQS.
+CA29 - O consumidor não deverá publicar diretamente mensagens nas filas de registro das clearings.
 
-CA30 - A responsabilidade pela deduplicação definitiva deverá pertencer ao consumidor de persistência.
+CA30 - O processamento de mensagens duplicadas não deverá produzir novos eventos de criação da operação.
 
-CA31 - O AWS Batch deverá permitir rastrear cada mensagem até seu arquivo e execução de origem.
+CA31 - A solução deverá permitir rastrear a origem e o resultado de processamento de cada mensagem.
 
-CA32 - A execução deverá registrar totais de linhas lidas, operações válidas, mensagens publicadas, rejeições e falhas.
+CA32 - A implementação deverá disponibilizar logs estruturados.
 
-CA33 - O processo deverá produzir relatório final de ingestão com informações suficientes para conciliação dos registros do arquivo.
+CA33 - A implementação deverá disponibilizar métricas de throughput, latência, falhas e duplicidades.
 
-CA34 - O relatório deverá distinguir mensagens aceitas pelo SQS de operações efetivamente persistidas no DynamoDB.
+CA34 - Deverão existir métricas e alertas para backlog e mensagens na DLQ.
 
-CA35 - O job não poderá ser considerado integralmente bem-sucedido caso existam operações válidas não publicadas após esgotamento das tentativas.
+CA35 - As permissões IAM deverão seguir o princípio do menor privilégio.
 
-CA36 - O processo deverá disponibilizar logs estruturados e métricas de throughput, latência, retries, falhas e utilização de recursos.
+CA36 - A infraestrutura deverá ser provisionada por Terraform.
 
-CA37 - Os logs não deverão expor indiscriminadamente dados sensíveis das operações financeiras.
+CA37 - Deverão existir testes unitários para validação, mapeamento e idempotência.
 
-CA38 - O job deverá utilizar IAM Role com permissões restritas aos recursos necessários.
+CA38 - Deverão existir testes de integração para persistência transacional.
 
-CA39 - O código e a imagem Docker não deverão conter credenciais AWS fixas.
+CA39 - Deverão existir testes para mensagens duplicadas e processamento concorrente.
 
-CA40 - A infraestrutura deverá ser provisionada por Terraform conforme os padrões da empresa.
+CA40 - Deverão existir testes para falhas parciais de lotes SQS.
 
-CA41 - Deverá existir imagem Docker versionada e publicada no Amazon ECR.
+CA41 - Deverá ser validado o comportamento em cenários de throttling e indisponibilidade temporária do DynamoDB.
 
-CA42 - A implementação deverá possuir testes unitários para parser, adaptadores, validadores e publisher.
+CA42 - Deverá ser realizado teste de carga com 2 milhões de operações.
 
-CA43 - Deverão existir testes de integração para publicação no SQS, incluindo falhas parciais de SendMessageBatch.
+CA43 - Deverá ser realizado teste de carga com 3 milhões de operações.
 
-CA44 - Deverá ser validado o comportamento do processo em situações de throttling, timeout e falhas transitórias do SQS.
+CA44 - Os testes de carga deverão registrar throughput, latência, duração, consumo de capacidade e taxa de falhas.
 
-CA45 - Deverá ser validado o reprocessamento de um arquivo após interrupção com publicação parcial.
+CA45 - A solução deverá demonstrar capacidade de consumir o volume esperado dentro da janela operacional homologada.
 
-CA46 - Deverá ser realizado teste de carga com 2 milhões de operações.
-
-CA47 - Deverá ser realizado teste de carga com 3 milhões de operações.
-
-CA48 - O teste de carga deverá registrar throughput, duração total, consumo de CPU, memória, latência e quantidade de retries.
-
-CA49 - A solução deverá demonstrar que consegue processar o volume esperado dentro da janela de ingestão definida pelo projeto, quando essa janela for homologada.
-
-CA50 - O fluxo de ingestão deverá permanecer desacoplado do fluxo de persistência e registro nas clearings.
-
-CA51 - A publicação bem-sucedida no SQS deverá representar exclusivamente a confirmação de aceite da mensagem pela fila, não a confirmação de persistência ou registro financeiro.
-
-CA52 - A implementação deverá possuir documentação técnica de execução, configuração, monitoramento, tratamento de falhas e reprocessamento.
+CA46 - A solução deverá possuir documentação técnica de configuração, execução, monitoramento, tratamento de falhas e reprocessamento.
 
 DEFINIÇÃO DE PRONTO
 
-A história será considerada concluída quando o AWS Batch conseguir receber um arquivo CSV do S3, interpretar seus registros, aplicar o adaptador RDB, validar as operações, gerar o modelo canônico e publicar todas as operações válidas no SQS, com rastreabilidade e tratamento adequado de falhas.
+A história será considerada concluída quando uma mensagem válida publicada na fila SQS de ingestão for consumida pela AWS Lambda, validada e persistida transacionalmente nas tabelas OPERACOES e REGISTROS_CLEARING.
 
-A solução deverá possuir testes automatizados, infraestrutura provisionada, observabilidade operacional e evidências de teste de carga.
+O processamento deverá impedir duplicidades, preservar a consistência entre as tabelas, tratar falhas individuais e permitir recuperação por meio de retries e DLQ.
 
-A persistência no DynamoDB e o registro efetivo nas clearings não serão requisitos para conclusão desta história, pois pertencem a etapas posteriores da arquitetura.
+A solução deverá possuir infraestrutura provisionada, testes automatizados, observabilidade e evidências de testes de carga compatíveis com a volumetria esperada.
